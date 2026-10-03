@@ -1,0 +1,17 @@
+[package]
+name = "tpt-microgrid-desktop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tpt-microgrid-sizer-pro"
+path = "src/main.rs"
+
+[dependencies]
+tpt-appfront-webview = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-webview" }
+# Embeds ../dist into the exe: the Gumroad download is a single file that
+# unpacks its own web bundle on first run.
+include_dir = "0.7"
+# Opens tptsolutions.co.nz links in the OS browser via the open_external IPC.
+open = "5"

@@ -1,0 +1,17 @@
+[package]
+name = "tpt-microgrid-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+# Pro edition: full seasonal (12-month) simulation, battery/generation
+# sizing optimization, and system-design report generation. The free engine
+# surface is the single-day balance; `pro` unlocks the rest.
+pro = []
+
+[dependencies]
+tpt-nrg-solar = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-energy/crates/resource/tpt-nrg-solar" }
+tpt-nrg-battery = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-energy/crates/storage/tpt-nrg-battery" }
+chrono = "0.4"

@@ -1,0 +1,5 @@
+# Trunk config for the standalone/desktop bundle.
+# wasm-opt is disabled via data-wasm-opt="0" on the <link data-trunk> tag in
+# index.html (trunk 0.21 ignores [tools] wasm-opt = false).
+[tools]
+wasm-opt = false

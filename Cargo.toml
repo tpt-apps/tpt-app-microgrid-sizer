@@ -1,0 +1,49 @@
+[package]
+name = "tpt-app-microgrid-sizer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = [".", "engine", "desktop"]
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Pro edition (paid desktop build): full seasonal simulation, battery/solar
+# sizing optimization, and exportable system-design reports. The free WASM
+# build compiles without it; `--features pro` is Pro.
+pro = ["tpt-microgrid-engine/pro"]
+
+[dependencies]
+tpt-appfront-core = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-core" }
+tpt-appfront-dom = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-dom" }
+tpt-microgrid-engine = { path = "engine" }
+# Pinned to the installed wasm-bindgen CLI version — the CLI rejects wasm
+# built against a different schema version. Bump both together.
+wasm-bindgen = "=0.2.128"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Document", "Window", "Location", "Element", "Node", "HtmlElement",
+    "HtmlInputElement", "HtmlSelectElement", "HtmlAnchorElement",
+    "CssStyleDeclaration", "HtmlCollection",
+    "HtmlCanvasElement", "CanvasRenderingContext2d",
+    "Event", "EventTarget", "Blob", "Url",
+    "MouseEvent", "DomRect",
+] }
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The desktop shell is a native binary; keep its codegen normal even in the
+# same workspace (the `release` profile above applies to the wasm lib build).
+[profile.release.package.tpt-microgrid-desktop]
+opt-level = 3
