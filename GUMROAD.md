@@ -86,11 +86,13 @@ preinstalled on both — nothing extra to download.
 
 ## Cover image / thumbnail
 
-Not created yet. A screenshot of a full seasonal load/generation chart with
-a real system profile loaded is the most convincing cover once built. No
-stock/AI art. (`target\verify\pro-full.png` from the verification pass is a
-reasonable starting point; re-shoot at a nicer window size for the real
-thing.)
+`cover.png` in this repo — the Pro seasonal-simulation card (small
+commercial profile, 30 kWp / 60 kWh) captured at 2× from the built bundle.
+Re-shoot after meaningful UI changes: serve `dist\desktop` (e.g.
+`python -m http.server 8127`), load the page headless, apply the preset +
+sizes, run the seasonal simulation, and clip the third `.mg-main .mg-card`
+to `cover.png` (the script used lives in `target\cdp-cover.mjs`; `target\`
+is not committed). No stock/AI art.
 
 ## After publishing
 
