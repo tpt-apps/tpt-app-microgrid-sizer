@@ -42,6 +42,7 @@ pub const MONTHS_PER_YEAR: usize = 12;
 const REPRESENTATIVE_DAY: u32 = 21;
 /// Day counts per month for `REPRESENTATIVE_YEAR` (non-leap) — the seasonal
 /// simulation scales each representative day by its month's length.
+#[cfg(feature = "pro")]
 const MONTH_DAYS: [u32; MONTHS_PER_YEAR] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 /// Calendar year used for solar geometry (declination differs between
 /// years by well under the model's accuracy).
@@ -629,6 +630,8 @@ pub struct MonthSummary {
     pub curtailed_kwh: f64,
     /// Grid-side energy delivered by the battery, kWh.
     pub discharged_kwh: f64,
+    /// Energy supplied by the backup generator, kWh.
+    pub generator_kwh: f64,
 }
 
 /// Result of the full seasonal (12-month) simulation.
@@ -644,6 +647,10 @@ pub struct SeasonalResult {
     pub unmet_kwh: f64,
     /// Annual curtailed solar, kWh.
     pub curtailed_kwh: f64,
+    /// Annual energy supplied by the backup generator, kWh.
+    pub generator_kwh: f64,
+    /// Annual generator fuel use, litres.
+    pub fuel_litres: f64,
     /// Unmet energy in the worst month, kWh — the month that governs
     /// sizing.
     pub worst_month_unmet_kwh: f64,
@@ -681,10 +688,26 @@ pub fn simulate_seasonal(
     base_load: &DayLoad,
     factors: &MonthlyFactors,
 ) -> SeasonalResult {
+    simulate_seasonal_with_generator(site, array, battery, base_load, factors, None)
+}
+
+/// [`simulate_seasonal`] with an optional backup generator that serves
+/// whatever the PV and battery leave unmet, up to its rated power each hour.
+#[cfg(feature = "pro")]
+pub fn simulate_seasonal_with_generator(
+    site: &Site,
+    array: &SolarArray,
+    battery: &BatterySpec,
+    base_load: &DayLoad,
+    factors: &MonthlyFactors,
+    generator: Option<&GeneratorSpec>,
+) -> SeasonalResult {
     let mut months = Vec::with_capacity(MONTHS_PER_YEAR);
     let mut totals = DispatchTotals::default();
     let mut worst_month = 0usize;
     let mut worst_month_unmet_kwh = 0.0f64;
+    let mut generator_kwh = 0.0f64;
+    let mut fuel_litres = 0.0f64;
 
     for m in 0..MONTHS_PER_YEAR {
         let array_m = SolarArray {
@@ -695,22 +718,29 @@ pub fn simulate_seasonal(
         let load_m = base_load.scaled(factors.load[m]);
         let day = simulate_steady_day(site, &array_m, battery, &load_m, m);
         let scale = f64::from(MONTH_DAYS[m]);
+        let gen_day_kwh = generator
+            .map(|g| generator_energy_kwh(&day.hours, g))
+            .unwrap_or(0.0);
+        let unmet_day_kwh = (day.totals.unmet_kwh - gen_day_kwh).max(0.0);
+        generator_kwh += gen_day_kwh * scale;
+        fuel_litres += gen_day_kwh * scale * generator.map_or(0.0, |g| g.fuel_l_per_kwh);
         totals.load_kwh += day.totals.load_kwh * scale;
         totals.solar_kwh += day.totals.solar_kwh * scale;
-        totals.unmet_kwh += day.totals.unmet_kwh * scale;
+        totals.unmet_kwh += unmet_day_kwh * scale;
         totals.curtailed_kwh += day.totals.curtailed_kwh * scale;
         totals.discharged_kwh += day.totals.discharged_kwh * scale;
-        if day.totals.unmet_kwh * scale > worst_month_unmet_kwh {
-            worst_month_unmet_kwh = day.totals.unmet_kwh * scale;
+        if unmet_day_kwh * scale > worst_month_unmet_kwh {
+            worst_month_unmet_kwh = unmet_day_kwh * scale;
             worst_month = m;
         }
         months.push(MonthSummary {
             month: m,
             load_kwh: day.totals.load_kwh * scale,
             solar_kwh: day.totals.solar_kwh * scale,
-            unmet_kwh: day.totals.unmet_kwh * scale,
+            unmet_kwh: unmet_day_kwh * scale,
             curtailed_kwh: day.totals.curtailed_kwh * scale,
             discharged_kwh: day.totals.discharged_kwh * scale,
+            generator_kwh: gen_day_kwh * scale,
         });
     }
 
@@ -720,6 +750,8 @@ pub fn simulate_seasonal(
         solar_kwh: totals.solar_kwh,
         unmet_kwh: totals.unmet_kwh,
         curtailed_kwh: totals.curtailed_kwh,
+        generator_kwh,
+        fuel_litres,
         worst_month_unmet_kwh,
         worst_month,
     }
@@ -764,6 +796,61 @@ fn simulate_steady_day(
     }
 }
 
+/// An optional diesel/petrol backup generator that serves load the PV and
+/// battery cannot. It follows load (never charges the battery), up to its
+/// rated power each hour.
+#[derive(Debug, Clone)]
+pub struct GeneratorSpec {
+    /// Rated output, kW.
+    pub power_kw: f64,
+    /// Fuel burn per kWh generated, litres/kWh (about 0.3 for a small diesel).
+    pub fuel_l_per_kwh: f64,
+    /// Fuel price, USD per litre.
+    pub fuel_cost_usd_per_l: f64,
+    /// Installed generator cost, USD per kW.
+    pub cost_usd_per_kw: f64,
+}
+
+impl Default for GeneratorSpec {
+    fn default() -> Self {
+        Self {
+            power_kw: 5.0,
+            fuel_l_per_kwh: 0.3,
+            fuel_cost_usd_per_l: 1.5,
+            cost_usd_per_kw: 400.0,
+        }
+    }
+}
+
+impl GeneratorSpec {
+    /// Validity errors, phrased for direct display in the UI.
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if !(0.0..=10_000.0).contains(&self.power_kw) {
+            issues.push("Generator power must be between 0 and 10,000 kW.".to_string());
+        }
+        if !(0.0..=2.0).contains(&self.fuel_l_per_kwh) {
+            issues.push("Generator fuel use must be between 0 and 2 L/kWh.".to_string());
+        }
+        if !(0.0..=100.0).contains(&self.fuel_cost_usd_per_l) {
+            issues.push("Fuel cost must be between 0 and 100 $/L.".to_string());
+        }
+        if !(0.0..=100_000.0).contains(&self.cost_usd_per_kw) {
+            issues.push("Generator cost must be between 0 and 100,000 $/kW.".to_string());
+        }
+        issues
+    }
+}
+
+/// Energy a load-following generator supplies from an hourly unmet profile.
+#[cfg(feature = "pro")]
+fn generator_energy_kwh(hours: &[HourPoint], generator: &GeneratorSpec) -> f64 {
+    hours
+        .iter()
+        .map(|h| h.unmet_kw.min(generator.power_kw.max(0.0)))
+        .sum()
+}
+
 /// Cost and target inputs for the sizing optimization.
 #[derive(Debug, Clone)]
 pub struct OptimizationInputs {
@@ -775,6 +862,17 @@ pub struct OptimizationInputs {
     pub target_served_fraction: f64,
     /// Battery power rating per kWh of capacity (kW/kWh; 0.5 = 2-hour).
     pub battery_power_ratio: f64,
+    /// Real discount rate used to annualise capital (0.07 = 7%).
+    pub discount_rate: f64,
+    /// Project lifetime in years.
+    pub project_years: f64,
+    /// Annual operations & maintenance cost as a fraction of capex.
+    pub om_fraction_of_capex: f64,
+    /// Battery replacement interval in years (replaced within the project
+    /// life whenever it is shorter).
+    pub battery_life_years: f64,
+    /// Optional backup generator included in every candidate design.
+    pub generator: Option<GeneratorSpec>,
 }
 
 impl Default for OptimizationInputs {
@@ -784,6 +882,11 @@ impl Default for OptimizationInputs {
             battery_cost_usd_per_kwh: 600.0,
             target_served_fraction: 0.99,
             battery_power_ratio: 0.5,
+            discount_rate: 0.07,
+            project_years: 20.0,
+            om_fraction_of_capex: 0.015,
+            battery_life_years: 10.0,
+            generator: None,
         }
     }
 }
@@ -804,6 +907,21 @@ impl OptimizationInputs {
         if !(0.05..=4.0).contains(&self.battery_power_ratio) {
             issues.push("Battery power ratio must be between 0.05 and 4 kW/kWh.".to_string());
         }
+        if !(0.0..=0.5).contains(&self.discount_rate) {
+            issues.push("Discount rate must be between 0% and 50%.".to_string());
+        }
+        if !(1.0..=50.0).contains(&self.project_years) {
+            issues.push("Project life must be between 1 and 50 years.".to_string());
+        }
+        if !(0.0..=0.2).contains(&self.om_fraction_of_capex) {
+            issues.push("O&M must be between 0% and 20% of capex per year.".to_string());
+        }
+        if !(1.0..=50.0).contains(&self.battery_life_years) {
+            issues.push("Battery life must be between 1 and 50 years.".to_string());
+        }
+        if let Some(generator) = &self.generator {
+            issues.extend(generator.validate());
+        }
         issues
     }
 }
@@ -823,9 +941,47 @@ pub struct SizingRecommendation {
     pub served_fraction: f64,
     /// Annual unmet energy at the recommendation, kWh.
     pub unmet_kwh: f64,
+    /// Annual generator fuel use at the recommendation, litres.
+    pub fuel_litres: f64,
     /// False when no candidate in the search grid reached the target —
     /// the result is the best-effort (lowest-unmet) candidate instead.
     pub feasible: bool,
+    /// Levelised annual cost (annualised capex + O&M + battery
+    /// replacements), USD per year.
+    pub annual_cost_usd: f64,
+    /// Levelised cost of the energy actually served, USD per kWh
+    /// (infinite when nothing is served).
+    pub lcoe_usd_per_kwh: f64,
+}
+
+/// Levelised annual cost of a PV + battery design: capex annualised with the
+/// capital recovery factor, plus O&M, plus the battery's replacements
+/// (each discounted to year 0 and annualised the same way).
+///
+/// Generator capex (when `inputs.generator` is set) is annualised like the
+/// PV; fuel is added by the caller, since it depends on the simulation.
+pub fn annual_cost_usd(solar_kw: f64, battery_kwh: f64, inputs: &OptimizationInputs) -> f64 {
+    let pv_capex = solar_kw * inputs.pv_cost_usd_per_kw
+        + inputs
+            .generator
+            .as_ref()
+            .map_or(0.0, |g| g.power_kw * g.cost_usd_per_kw);
+    let battery_capex = battery_kwh * inputs.battery_cost_usd_per_kwh;
+    let n = inputs.project_years;
+    let r = inputs.discount_rate;
+    let crf = if r.abs() < 1e-9 {
+        1.0 / n
+    } else {
+        r * (1.0 + r).powf(n) / ((1.0 + r).powf(n) - 1.0)
+    };
+    let mut replacement_pv = 0.0;
+    let mut year = inputs.battery_life_years;
+    while year < n - 1e-9 {
+        replacement_pv += battery_capex / (1.0 + r).powf(year);
+        year += inputs.battery_life_years;
+    }
+    (pv_capex + battery_capex + replacement_pv) * crf
+        + (pv_capex + battery_capex) * inputs.om_fraction_of_capex
 }
 
 /// Searches PV × battery combinations over the seasonal simulation and
@@ -871,16 +1027,35 @@ pub fn recommend_size(
                 capacity_kw: solar_kw,
                 ..array.clone()
             };
-            let seasonal = simulate_seasonal(site, &array_c, &battery, base_load, factors);
+            let seasonal = simulate_seasonal_with_generator(
+                site,
+                &array_c,
+                &battery,
+                base_load,
+                factors,
+                inputs.generator.as_ref(),
+            );
+            let fuel_cost = seasonal.fuel_litres
+                * inputs.generator.as_ref().map_or(0.0, |g| g.fuel_cost_usd_per_l);
+            let cost = annual_cost_usd(solar_kw, battery_kwh, inputs) + fuel_cost;
+            let served_kwh = seasonal.load_kwh - seasonal.unmet_kwh;
+            let lcoe = if served_kwh > 1e-9 { cost / served_kwh } else { f64::INFINITY };
             let candidate = SizingRecommendation {
                 solar_kw,
                 battery_kwh,
                 battery_kw: battery_kwh * inputs.battery_power_ratio,
                 capex_usd: solar_kw * inputs.pv_cost_usd_per_kw
-                    + battery_kwh * inputs.battery_cost_usd_per_kwh,
+                    + battery_kwh * inputs.battery_cost_usd_per_kwh
+                    + inputs
+                        .generator
+                        .as_ref()
+                        .map_or(0.0, |g| g.power_kw * g.cost_usd_per_kw),
                 served_fraction: seasonal.served_fraction(),
                 unmet_kwh: seasonal.unmet_kwh,
+                fuel_litres: seasonal.fuel_litres,
                 feasible: seasonal.served_fraction() >= inputs.target_served_fraction,
+                annual_cost_usd: cost,
+                lcoe_usd_per_kwh: lcoe,
             };
             let better_feasible = match &best_feasible {
                 Some(best) => {
@@ -1016,6 +1191,14 @@ pub fn design_report_markdown(
         "- Annual curtailed solar: {}",
         format_kwh(seasonal.curtailed_kwh)
     );
+    if seasonal.generator_kwh > 0.0 {
+        let _ = writeln!(
+            out,
+            "- Backup generator: {} ({:.0} L fuel/year)",
+            format_kwh(seasonal.generator_kwh),
+            seasonal.fuel_litres
+        );
+    }
 
     if let Some(rec) = recommendation {
         out.push_str("\n## Recommended sizing\n\n");
@@ -1026,6 +1209,11 @@ pub fn design_report_markdown(
             rec.battery_kwh, rec.battery_kw
         );
         let _ = writeln!(out, "- Estimated capex: **US$ {:.0}**", rec.capex_usd);
+        let _ = writeln!(
+            out,
+            "- Levelised annual cost: US$ {:.0}/year; LCOE: US$ {:.3}/kWh served",
+            rec.annual_cost_usd, rec.lcoe_usd_per_kwh
+        );
         let _ = writeln!(
             out,
             "- Achieved served fraction: {:.1}% ({} unmet/year)",
@@ -1528,5 +1716,100 @@ mod tests {
         );
         assert!(!rec.feasible);
         assert!(rec.capex_usd > 0.0);
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn annual_cost_matches_hand_calculation() {
+        let inputs = OptimizationInputs {
+            pv_cost_usd_per_kw: 1000.0,
+            battery_cost_usd_per_kwh: 500.0,
+            discount_rate: 0.0,
+            project_years: 20.0,
+            om_fraction_of_capex: 0.01,
+            battery_life_years: 10.0,
+            ..OptimizationInputs::default()
+        };
+        // 10 kWp + 10 kWh: capex 10,000 + 5,000; one battery replacement at
+        // year 10 (5,000); zero discounting => (15,000 + 5,000)/20 = 1,000,
+        // plus O&M 1% of 15,000 = 150.
+        let cost = annual_cost_usd(10.0, 10.0, &inputs);
+        assert!((cost - 1150.0).abs() < 1e-6, "cost = {cost}");
+        let rec_cost_with_rate = annual_cost_usd(
+            10.0,
+            10.0,
+            &OptimizationInputs {
+                discount_rate: 0.07,
+                ..inputs
+            },
+        );
+        assert!(rec_cost_with_rate > cost);
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn generator_covers_unmet_and_counts_fuel() {
+        let array = SolarArray {
+            capacity_kw: 1.0,
+            ..SolarArray::default()
+        };
+        let battery = BatterySpec::default();
+        let run = |generator: Option<&GeneratorSpec>| {
+            simulate_seasonal_with_generator(
+                &Site::default(),
+                &array,
+                &battery,
+                &DayLoad::default(),
+                &MonthlyFactors::default(),
+                generator,
+            )
+        };
+        let without = run(None);
+        assert!(without.unmet_kwh > 0.0);
+        assert_eq!(without.generator_kwh, 0.0);
+        let generator = GeneratorSpec {
+            power_kw: 100.0,
+            fuel_l_per_kwh: 0.25,
+            ..GeneratorSpec::default()
+        };
+        let with = run(Some(&generator));
+        assert!(with.unmet_kwh < 1e-6, "unmet = {}", with.unmet_kwh);
+        assert!((with.generator_kwh - without.unmet_kwh).abs() < 1e-6);
+        assert!((with.fuel_litres - with.generator_kwh * 0.25).abs() < 1e-6);
+        // Conservation: served energy is unchanged in total.
+        assert!((with.load_kwh - without.load_kwh).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn limited_generator_leaves_residual_unmet() {
+        let array = SolarArray {
+            capacity_kw: 0.1,
+            ..SolarArray::default()
+        };
+        let weak = GeneratorSpec {
+            power_kw: 0.1,
+            ..GeneratorSpec::default()
+        };
+        let result = simulate_seasonal_with_generator(
+            &Site::default(),
+            &array,
+            &BatterySpec::default(),
+            &DayLoad::default(),
+            &MonthlyFactors::default(),
+            Some(&weak),
+        );
+        assert!(result.unmet_kwh > 0.0);
+        assert!(result.generator_kwh > 0.0);
+    }
+
+    #[test]
+    fn generator_validation_rejects_bad_values() {
+        assert!(GeneratorSpec::default().validate().is_empty());
+        let bad = GeneratorSpec {
+            fuel_l_per_kwh: f64::NAN,
+            ..GeneratorSpec::default()
+        };
+        assert!(!bad.validate().is_empty());
     }
 }

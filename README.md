@@ -11,8 +11,9 @@ Two editions ship from this one codebase:
 [tptsolutions.co.nz/tools/microgrid-sizer](https://tptsolutions.co.nz/tools/microgrid-sizer):
 single-day load/generation balance, one battery size |
 | **Pro** | `--features pro` | Paid desktop exe (Gumroad, $149): full
-seasonal (12-month) simulation, battery/generation sizing optimization,
-exportable system-design reports. |
+seasonal (12-month) simulation (steady-state daily cycle per month), PV +
+battery sizing optimization with optional backup generator and levelised
+cost (LCOE), exportable system-design reports. |
 
 ## Layout
 

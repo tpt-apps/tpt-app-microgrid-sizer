@@ -32,7 +32,7 @@ use crate::chart;
 
 #[cfg(feature = "pro")]
 use tpt_microgrid_engine::{
-    design_report_markdown, recommend_size, simulate_seasonal, MonthlyFactors, OptimizationInputs,
+    design_report_markdown, recommend_size, simulate_seasonal_with_generator, GeneratorSpec, MonthlyFactors, OptimizationInputs,
     SeasonalResult, SizingRecommendation,
 };
 
@@ -189,6 +189,18 @@ mod defaults {
     pub const OPT_TARGET: &str = "0.99";
     #[cfg(feature = "pro")]
     pub const OPT_RATIO: &str = "0.5";
+    #[cfg(feature = "pro")]
+    pub const OPT_DISCOUNT: &str = "7";
+    #[cfg(feature = "pro")]
+    pub const OPT_YEARS: &str = "20";
+    #[cfg(feature = "pro")]
+    pub const OPT_OM: &str = "1.5";
+    #[cfg(feature = "pro")]
+    pub const OPT_BAT_LIFE: &str = "10";
+    #[cfg(feature = "pro")]
+    pub const GEN_KW: &str = "0";
+    #[cfg(feature = "pro")]
+    pub const GEN_FUEL_COST: &str = "1.5";
 }
 
 /// Mounts the whole app into `container` (the hub's container div, or the
@@ -597,6 +609,57 @@ fn shell_tree() -> UITree<Msg> {
                             field
                                 .input(defaults::OPT_RATIO)
                                 .class("mg-input mg-opt-ratio");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Discount rate (%)");
+                            field
+                                .input(defaults::OPT_DISCOUNT)
+                                .class("mg-input mg-opt-discount");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Project life (years)");
+                            field
+                                .input(defaults::OPT_YEARS)
+                                .class("mg-input mg-opt-years");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "O&M (% of capex/yr)");
+                            field
+                                .input(defaults::OPT_OM)
+                                .class("mg-input mg-opt-om");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Battery life (years)");
+                            field
+                                .input(defaults::OPT_BAT_LIFE)
+                                .class("mg-input mg-opt-bat-life");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Backup generator (kW, 0 = none)");
+                            field
+                                .input(defaults::GEN_KW)
+                                .class("mg-input mg-gen-kw");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Fuel cost ($/L)");
+                            field
+                                .input(defaults::GEN_FUEL_COST)
+                                .class("mg-input mg-gen-fuel");
                         })
                         .class("mg-field");
                     })
@@ -1092,7 +1155,27 @@ fn read_optimization(container: &web_sys::Element, issues: &mut Vec<String>) -> 
             .parse()
             .unwrap_or(0.99),
         battery_power_ratio: num(container, ".mg-opt-ratio", "Battery power ratio", issues),
+        discount_rate: num(container, ".mg-opt-discount", "Discount rate", issues) / 100.0,
+        project_years: num(container, ".mg-opt-years", "Project life", issues),
+        om_fraction_of_capex: num(container, ".mg-opt-om", "O&M", issues) / 100.0,
+        battery_life_years: num(container, ".mg-opt-bat-life", "Battery life", issues),
+        generator: read_generator(container, issues),
     }
+}
+
+/// Reads the optional backup generator (`None` when its power is 0).
+#[cfg(feature = "pro")]
+fn read_generator(container: &web_sys::Element, issues: &mut Vec<String>) -> Option<GeneratorSpec> {
+    let power_kw = num(container, ".mg-gen-kw", "Generator power", issues);
+    let fuel_cost = num(container, ".mg-gen-fuel", "Fuel cost", issues);
+    if power_kw.is_nan() || power_kw <= 0.0 {
+        return None;
+    }
+    Some(GeneratorSpec {
+        power_kw,
+        fuel_cost_usd_per_l: fuel_cost,
+        ..GeneratorSpec::default()
+    })
 }
 
 /// Runs the 12-month simulation and publishes the outcome.
@@ -1104,9 +1187,13 @@ fn run_seasonal(container: &web_sys::Element, seasonal: &Signal<SeasonalOutcome>
     let battery = read_battery(container, &mut issues);
     let load = read_load(container, &mut issues);
     let factors = read_factors(container, &mut issues);
+    let generator = read_generator(container, &mut issues);
     if !issues.is_empty() {
         seasonal.set(SeasonalOutcome::Invalid(issues));
         return;
+    }
+    if let Some(generator) = &generator {
+        issues.extend(generator.validate());
     }
     issues.extend(site.validate());
     issues.extend(array.validate());
@@ -1117,8 +1204,13 @@ fn run_seasonal(container: &web_sys::Element, seasonal: &Signal<SeasonalOutcome>
         seasonal.set(SeasonalOutcome::Invalid(issues));
         return;
     }
-    seasonal.set(SeasonalOutcome::Solved(Rc::new(simulate_seasonal(
-        &site, &array, &battery, &load, &factors,
+    seasonal.set(SeasonalOutcome::Solved(Rc::new(simulate_seasonal_with_generator(
+        &site,
+        &array,
+        &battery,
+        &load,
+        &factors,
+        generator.as_ref(),
     ))));
 }
 
@@ -1360,10 +1452,12 @@ fn rec_results_view(outcome: RecOutcome) -> UITree<Msg> {
                     summary,
                     if rec.feasible {
                         format!(
-                            "Meets the target at {:.1}% served ({} unmet/year). Estimated capex US$ {:.0}.",
+                            "Meets the target at {:.1}% served ({} unmet/year). Estimated capex US$ {:.0}; levelised cost US$ {:.3}/kWh served (US$ {:.0}/year).",
                             rec.served_fraction * 100.0,
                             fmt_kwh(rec.unmet_kwh),
-                            rec.capex_usd
+                            rec.capex_usd,
+                            rec.lcoe_usd_per_kwh,
+                            rec.annual_cost_usd
                         )
                     } else {
                         format!(
