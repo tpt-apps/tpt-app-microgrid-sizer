@@ -35,7 +35,7 @@
 - [x] Validation against a simple hand-checkable load/generation scenario
       (battery-only dispatch empties in exactly capacity/load hours; charge
       losses = sqrt(RTE) per leg; SoC floor; power-rating curtailment;
-      hemisphere seasonality) — 10 free + 14 pro tests green
+      hemisphere seasonality) — now 13 free + 25 pro tests green
 
 ## Phase 2 — Free WASM UI
 - [x] Single-day load profile input (24 hourly fields + presets) + one
@@ -50,8 +50,8 @@
 
 ## Phase 3 — Paid desktop edition (cargo feature `pro`)
 - [x] `pro` gates: full seasonal simulation (12 representative days scaled by
-      month length, monthly load/cloud/temperature factors, SoC carried
-      between months), battery/generation sizing optimization (grid search
+      month length, monthly load/cloud/temperature factors, each day run to a
+      steady-state SoC cycle), battery/generation sizing optimization (grid search
       over PV × battery for cheapest design meeting a served-energy target),
       exportable system-design reports (Markdown download)
 - [x] Pro UI: seasonal factor grid, sizing-optimization inputs + recommendation
@@ -71,3 +71,50 @@
       errors); prod check after the web repo deploy (manual)
 - [x] WASM size budget check on the shipped build — **99.3 KB gzipped** against
       the ~600 KB budget
+
+## Phase 5 — Review follow-ups (platform review, 2026-10)
+Done:
+- [x] kWh/MWh unit bug in formatters (engine + UI); `format_kwh` test
+- [x] Optimizer honours the user's battery settings (`recommend_size` takes a `BatterySpec`)
+- [x] Desktop `open_external` host allow-list (exact host match) + test
+- [x] Cargo path deps made relative (`../tpt-appfront`, `../../tpt-energy`)
+- [x] Seasonal model: each month's day iterated to a steady-state SoC cycle
+- [x] Solar position sampled at hour midpoint
+- [x] Desktop dist extraction keyed by app version
+- [x] Battery cycles use usable capacity; initial SoC below min SoC rejected
+- [x] Report: monthly factors table, initial SoC, generator line
+- [x] Free edition: clear-sky / 15 °C best-case caveat in the site card
+- [x] LCOE + annual cost (discount rate, project life, O&M, battery replacement)
+- [x] Optional backup generator in seasonal sim, optimizer and report
+- [x] Engine tests: NaN/range validation, zero-power battery, negative load,
+      infeasible optimizer target, generator, annual cost
+
+Open — bugs / robustness:
+- [ ] Multi-day cloudy-spell / autonomy check (seasonal model is still
+      optimistic for sites with long overcast runs)
+- [ ] Return an error when solar and load profile lengths differ (currently a
+      short solar array silently becomes zero sun)
+- [ ] Add optimizer cost inputs (and generator settings) to the report
+- [ ] Optimizer objective: minimise annual cost / LCOE rather than capex
+- [ ] Decide Pro licensing: key/activation check or honour system (the zip
+      ships the plaintext pro wasm)
+- [ ] Add a LICENSE file (owner to choose the licence)
+- [ ] `build.sh` should validate its web-repo path argument
+- [ ] Browser/desktop verification of the new Pro inputs (LCOE, generator,
+      steady-state seasonal) — wasm bundle not rebuilt since these changes
+
+Open — missing tests:
+- [ ] Report content beyond section headings; leap years, DST / fractional UTC
+      offsets, panel orientation
+- [ ] UI, chart and desktop shell tests
+- [ ] Test that the free build excludes Pro features
+
+Open — features (by value):
+- [ ] PV and battery degradation
+- [ ] Load CSV and TMY / measured weather import
+- [ ] CSV and PDF export; saved scenarios and side-by-side comparison
+- [ ] Inverter / peak-power sizing check and configurable DC/AC ratio
+- [ ] Reliability metrics: LOLP, days of autonomy
+- [ ] Tariffs, grid connection and export / net metering
+- [ ] Chart: resizable canvas, hover tooltips, accessibility text
+- [ ] Per-appliance load builder; shading and multi-orientation arrays
