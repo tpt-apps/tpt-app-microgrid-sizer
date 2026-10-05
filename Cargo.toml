@@ -19,8 +19,8 @@ default = []
 pro = ["tpt-microgrid-engine/pro"]
 
 [dependencies]
-tpt-appfront-core = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-core" }
-tpt-appfront-dom = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-dom" }
+tpt-appfront-core = { path = "../tpt-appfront/crates/tpt-appfront-core" }
+tpt-appfront-dom = { path = "../tpt-appfront/crates/tpt-appfront-dom" }
 tpt-microgrid-engine = { path = "engine" }
 # Pinned to the installed wasm-bindgen CLI version — the CLI rejects wasm
 # built against a different schema version. Bump both together.

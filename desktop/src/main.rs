@@ -64,7 +64,7 @@ fn main() {
                 let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 // Belt-and-braces on top of the ACL's string-type check: only
                 // ever hand the OS shell a tptsolutions.co.nz URL.
-                if url.starts_with("https://tptsolutions.co.nz") {
+                if is_allowed_url(url) {
                     let _ = open::that(url);
                 }
             }
@@ -74,6 +74,16 @@ fn main() {
     if let Err(error) = result {
         eprintln!("tpt-microgrid-sizer-pro: {error:#}");
         std::process::exit(1);
+    }
+}
+
+/// Accept only `https://tptsolutions.co.nz[/...]` — the host must match
+/// exactly (no userinfo, port, or look-alike suffix such as `.evil.com`).
+fn is_allowed_url(url: &str) -> bool {
+    const PREFIX: &str = "https://tptsolutions.co.nz";
+    match url.strip_prefix(PREFIX) {
+        Some(rest) => rest.is_empty() || rest.starts_with(['/', '?', '#']),
+        None => false,
     }
 }
 
@@ -96,10 +106,14 @@ fn resolve_dist_dir() -> PathBuf {
     extract_embedded_dist()
 }
 
-/// Writes the embedded [`DIST`] contents to a stable temp directory (once —
-/// subsequent launches reuse the extracted copy) and returns its path.
+/// Writes the embedded [`DIST`] contents to a temp directory keyed by app
+/// version (once per version — later launches reuse the extracted copy, but
+/// an upgraded exe never serves a stale bundle) and returns its path.
 fn extract_embedded_dist() -> PathBuf {
-    let out_dir = std::env::temp_dir().join(format!("{APP_ID}-dist"));
+    let out_dir = std::env::temp_dir().join(format!(
+        "{APP_ID}-dist-{}",
+        env!("CARGO_PKG_VERSION")
+    ));
     if !out_dir.join("index.html").exists() {
         let _ = std::fs::create_dir_all(&out_dir);
         if let Err(error) = DIST.extract(&out_dir) {
@@ -107,4 +121,19 @@ fn extract_embedded_dist() -> PathBuf {
         }
     }
     out_dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_url;
+
+    #[test]
+    fn allows_only_exact_host() {
+        assert!(is_allowed_url("https://tptsolutions.co.nz"));
+        assert!(is_allowed_url("https://tptsolutions.co.nz/apps?x=1#y"));
+        assert!(!is_allowed_url("https://tptsolutions.co.nz.evil.com"));
+        assert!(!is_allowed_url("https://tptsolutions.co.nz@evil.com"));
+        assert!(!is_allowed_url("http://tptsolutions.co.nz"));
+        assert!(!is_allowed_url(""));
+    }
 }

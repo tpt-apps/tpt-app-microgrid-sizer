@@ -12,6 +12,6 @@ default = []
 pro = []
 
 [dependencies]
-tpt-nrg-solar = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-energy/crates/resource/tpt-nrg-solar" }
-tpt-nrg-battery = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-energy/crates/storage/tpt-nrg-battery" }
+tpt-nrg-solar = { path = "../../tpt-energy/crates/resource/tpt-nrg-solar" }
+tpt-nrg-battery = { path = "../../tpt-energy/crates/storage/tpt-nrg-battery" }
 chrono = "0.4"
