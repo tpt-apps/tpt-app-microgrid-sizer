@@ -410,7 +410,7 @@ fn shell_tree() -> UITree<Msg> {
                         .class("mg-field");
                     })
                     .class("mg-row");
-                    card.text("The 21st of the selected month is simulated, at the site's fixed UTC offset (daylight saving is not modelled).")
+                    card.text("The 21st of the selected month is simulated, at the site's fixed UTC offset (daylight saving is not modelled). The free edition assumes clear sky and 15 degrees C, so results are best-case; Pro applies monthly cloud and temperature factors.")
                         .class("mg-hint");
                 })
                 .class("mg-card");
@@ -654,7 +654,7 @@ fn shell_tree() -> UITree<Msg> {
                 #[cfg(feature = "pro")]
                 main.container(|card| {
                     card.heading(3, "Seasonal simulation (Pro)");
-                    card.text("One representative day per month (the 21st), with the monthly load/cloud/temperature factors from the sidebar and the battery carrying charge between months.")
+                    card.text("One representative day per month (the 21st), with the monthly load/cloud/temperature factors from the sidebar with each day repeated until the battery charge settles into a steady daily cycle (the initial SoC does not affect the seasonal result).")
                         .class("mg-hint");
                     // The seasonal canvas is appended here by mount_app.
                     card.container(|_| {}).class("mg-seasonal-chart");
@@ -1128,6 +1128,7 @@ fn run_optimize(container: &web_sys::Element, recommendation: &Signal<RecOutcome
     let mut issues = Vec::new();
     let site = read_site(container, &mut issues);
     let array = read_array(container, &mut issues);
+    let battery = read_battery(container, &mut issues);
     let load = read_load(container, &mut issues);
     let factors = read_factors(container, &mut issues);
     let inputs = read_optimization(container, &mut issues);
@@ -1137,6 +1138,7 @@ fn run_optimize(container: &web_sys::Element, recommendation: &Signal<RecOutcome
     }
     issues.extend(site.validate());
     issues.extend(array.validate());
+    issues.extend(battery.validate());
     issues.extend(load.validate());
     issues.extend(factors.validate());
     issues.extend(inputs.validate());
@@ -1145,7 +1147,7 @@ fn run_optimize(container: &web_sys::Element, recommendation: &Signal<RecOutcome
         return;
     }
     recommendation.set(RecOutcome::Solved(Rc::new(recommend_size(
-        &site, &array, &load, &factors, &inputs,
+        &site, &array, &battery, &load, &factors, &inputs,
     ))));
 }
 
@@ -1224,7 +1226,7 @@ fn seasonal_results_view(outcome: SeasonalOutcome) -> UITree<Msg> {
                 styled_text(
                     summary,
                     format!(
-                        "{} kWh unmet of {} kWh across the year; the governing month is {} at {:.1}% served.",
+                        "{} unmet of {} across the year; the governing month is {} at {:.1}% served.",
                         fmt_kwh(result.unmet_kwh),
                         fmt_kwh(result.load_kwh),
                         MONTH_NAMES[result.worst_month],
@@ -1282,9 +1284,9 @@ fn percent_served(unmet: f64, load: f64) -> f64 {
 #[cfg(feature = "pro")]
 fn fmt_kwh(kwh: f64) -> String {
     if kwh >= 10_000.0 {
-        format!("{:.1}M", kwh / 1000.0)
+        format!("{:.1} MWh", kwh / 1000.0)
     } else {
-        format!("{:.1}", kwh)
+        format!("{:.1} kWh", kwh)
     }
 }
 
@@ -1358,14 +1360,14 @@ fn rec_results_view(outcome: RecOutcome) -> UITree<Msg> {
                     summary,
                     if rec.feasible {
                         format!(
-                            "Meets the target at {:.1}% served ({} kWh unmet/year). Estimated capex US$ {:.0}.",
+                            "Meets the target at {:.1}% served ({} unmet/year). Estimated capex US$ {:.0}.",
                             rec.served_fraction * 100.0,
                             fmt_kwh(rec.unmet_kwh),
                             rec.capex_usd
                         )
                     } else {
                         format!(
-                            "No candidate in the search grid met the target — best effort serves {:.1}% ({} kWh unmet/year) for US$ {:.0}. Consider a backup generator.",
+                            "No candidate in the search grid met the target — best effort serves {:.1}% ({} unmet/year) for US$ {:.0}. Consider a backup generator.",
                             rec.served_fraction * 100.0,
                             fmt_kwh(rec.unmet_kwh),
                             rec.capex_usd

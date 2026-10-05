@@ -208,6 +208,8 @@ impl BatterySpec {
         }
         if !(0.0..=1.0).contains(&self.initial_soc) {
             issues.push("Initial SoC must be between 0% and 100%.".to_string());
+        } else if self.min_soc <= 0.9 && self.initial_soc < self.min_soc {
+            issues.push("Initial SoC must not be below the minimum SoC.".to_string());
         }
         issues
     }
@@ -464,7 +466,8 @@ pub fn solar_profile_kw(site: &Site, array: &SolarArray, month: usize) -> Vec<f6
 
     (0..HOURS_PER_DAY)
         .map(|h| {
-            let pos = solar_model.solar_position(base_utc + Duration::hours(h as i64));
+            // Hour `h` covers [h, h+1): sample the sun at the midpoint.
+            let pos = solar_model.solar_position(base_utc + Duration::minutes(h as i64 * 60 + 30));
             let clear = plant.output_clearsky(&pos);
             // Clear-sky POA (undo soiling), scale by cloud, re-run the
             // public output path (re-applies soiling + thermal + clipping).
@@ -504,6 +507,17 @@ impl DayResult {
     }
 }
 
+/// Equivalent full cycles: discharged energy over *usable* capacity
+/// (nameplate above the SoC floor).
+fn equivalent_cycles(discharged_kwh: f64, battery: &BatterySpec) -> f64 {
+    let usable_kwh = battery.capacity_kwh * (1.0 - battery.min_soc.clamp(0.0, 0.95));
+    if usable_kwh > 1e-9 {
+        discharged_kwh / usable_kwh
+    } else {
+        0.0
+    }
+}
+
 /// Simulates one representative day of `month` (0 = January).
 pub fn simulate_day(
     site: &Site,
@@ -514,11 +528,7 @@ pub fn simulate_day(
 ) -> DayResult {
     let solar = solar_profile_kw(site, array, month);
     let (hours, totals) = dispatch_hours(&solar, &load.hourly_kw, battery);
-    let battery_cycles = if battery.capacity_kwh > 1e-9 {
-        totals.discharged_kwh / battery.capacity_kwh
-    } else {
-        0.0
-    };
+    let battery_cycles = equivalent_cycles(totals.discharged_kwh, battery);
     DayResult {
         month: month % MONTHS_PER_YEAR,
         hours,
@@ -654,12 +664,15 @@ impl SeasonalResult {
     }
 }
 
-/// Simulates the full year, one representative day per month, carrying
-/// battery SoC from each month into the next (January starts at the
-/// battery's configured initial SoC; December does not wrap). Each month's
-/// day is scaled by that month's day count, so month and annual totals read
-/// as real month/year energies; served fractions and the governing month
-/// are unaffected by the scaling.
+/// Simulates the full year, one representative day per month. Each day is
+/// repeated until the battery's state of charge returns to where the day
+/// started (the periodic steady state), so a month's result describes that
+/// month's sustainable operation and does not depend on the previous month
+/// or the configured initial SoC. Each month's day is scaled by that
+/// month's day count, so month and annual totals read as real month/year
+/// energies; served fractions and the governing month are unaffected by the
+/// scaling. A single repeating day has no multi-day cloudy spells, so
+/// results remain optimistic for sites with long overcast runs.
 #[cfg(feature = "pro")]
 pub fn simulate_seasonal(
     site: &Site,
@@ -669,7 +682,6 @@ pub fn simulate_seasonal(
     factors: &MonthlyFactors,
 ) -> SeasonalResult {
     let mut months = Vec::with_capacity(MONTHS_PER_YEAR);
-    let mut soc = battery.initial_soc;
     let mut totals = DispatchTotals::default();
     let mut worst_month = 0usize;
     let mut worst_month_unmet_kwh = 0.0f64;
@@ -681,12 +693,7 @@ pub fn simulate_seasonal(
             ..array.clone()
         };
         let load_m = base_load.scaled(factors.load[m]);
-        let battery_m = BatterySpec {
-            initial_soc: soc,
-            ..battery.clone()
-        };
-        let day = simulate_day(site, &array_m, &battery_m, &load_m, m);
-        soc = day.hours.last().map(|h| h.soc).unwrap_or(soc);
+        let day = simulate_steady_day(site, &array_m, battery, &load_m, m);
         let scale = f64::from(MONTH_DAYS[m]);
         totals.load_kwh += day.totals.load_kwh * scale;
         totals.solar_kwh += day.totals.solar_kwh * scale;
@@ -715,6 +722,45 @@ pub fn simulate_seasonal(
         curtailed_kwh: totals.curtailed_kwh,
         worst_month_unmet_kwh,
         worst_month,
+    }
+}
+
+/// Repeats the month's representative day until the end-of-day SoC matches
+/// the start-of-day SoC (or settles within tolerance), then returns that
+/// converged day.
+#[cfg(feature = "pro")]
+fn simulate_steady_day(
+    site: &Site,
+    array: &SolarArray,
+    battery: &BatterySpec,
+    load: &DayLoad,
+    month: usize,
+) -> DayResult {
+    const MAX_ITERATIONS: usize = 60;
+    const SOC_TOLERANCE: f64 = 1e-6;
+    // The solar profile is SoC-independent: compute it once.
+    let solar = solar_profile_kw(site, array, month);
+    let mut spec = battery.clone();
+    let mut run = dispatch_hours(&solar, &load.hourly_kw, &spec);
+    for _ in 0..MAX_ITERATIONS {
+        let end = run.0.last().map(|h| h.soc).unwrap_or(spec.initial_soc);
+        if (end - spec.initial_soc).abs() < SOC_TOLERANCE {
+            break;
+        }
+        spec.initial_soc = end;
+        run = dispatch_hours(&solar, &load.hourly_kw, &spec);
+    }
+    let (hours, totals) = run;
+    let battery_cycles = if battery.capacity_kwh > 1e-9 {
+        totals.discharged_kwh / battery.capacity_kwh
+    } else {
+        0.0
+    };
+    DayResult {
+        month: month % MONTHS_PER_YEAR,
+        hours,
+        totals,
+        battery_cycles,
     }
 }
 
@@ -790,10 +836,14 @@ pub struct SizingRecommendation {
 /// The grid scales with the load: PV from 1× to 8× peak demand, battery
 /// from 0.25× to 3× daily energy — coarse steps that land a design in the
 /// right ballpark, not a substitute for detailed engineering.
+///
+/// `battery_template` supplies the chemistry settings (round-trip
+/// efficiency, SoC floor, initial SoC); its capacity and power are swept.
 #[cfg(feature = "pro")]
 pub fn recommend_size(
     site: &Site,
     array: &SolarArray,
+    battery_template: &BatterySpec,
     base_load: &DayLoad,
     factors: &MonthlyFactors,
     inputs: &OptimizationInputs,
@@ -813,7 +863,7 @@ pub fn recommend_size(
             let battery = BatterySpec {
                 capacity_kwh: battery_kwh,
                 power_kw: battery_kwh * inputs.battery_power_ratio,
-                ..BatterySpec::default()
+                ..battery_template.clone()
             };
             // The optimizer sweeps capacity; the array's orientation comes
             // from the caller's design.
@@ -906,6 +956,17 @@ pub fn design_report_markdown(
         factors.load.iter().copied().fold(0.0f64, f64::max)
     );
 
+    out.push_str("\n## Monthly factors\n\n");
+    out.push_str("| Month | Load × | Cloud (fraction of clear sky) | Ambient °C |\n");
+    out.push_str("|---|---:|---:|---:|\n");
+    for m in 0..MONTHS_PER_YEAR {
+        let _ = writeln!(
+            out,
+            "| {} | {:.2} | {:.2} | {:.1} |",
+            MONTH_NAMES[m], factors.load[m], factors.cloud[m], factors.ambient_c[m]
+        );
+    }
+
     out.push_str("\n## Solar array\n\n");
     let _ = writeln!(out, "- Capacity: {:.1} kWp DC", array.capacity_kw);
     let _ = writeln!(out, "- Tilt: {:.0}°, azimuth: {:.0}° (0 = north)", array.tilt_deg, array.azimuth_deg);
@@ -913,11 +974,12 @@ pub fn design_report_markdown(
     out.push_str("\n## Battery\n\n");
     let _ = writeln!(
         out,
-        "- Capacity: {:.1} kWh nameplate ({:.0}% usable floor), power {:.1} kW, round-trip efficiency {:.0}%",
+        "- Capacity: {:.1} kWh nameplate ({:.0}% usable floor), power {:.1} kW, round-trip efficiency {:.0}%, initial SoC {:.0}%",
         battery.capacity_kwh,
         battery.min_soc * 100.0,
         battery.power_kw,
-        battery.round_trip_efficiency * 100.0
+        battery.round_trip_efficiency * 100.0,
+        battery.initial_soc * 100.0
     );
 
     out.push_str("\n## Seasonal simulation (representative day per month)\n\n");
@@ -937,21 +999,21 @@ pub fn design_report_markdown(
     }
     let _ = writeln!(
         out,
-        "\n- Annual served fraction: **{:.1}%** ({} kWh unmet of {} kWh)",
+        "\n- Annual served fraction: **{:.1}%** ({} unmet of {})",
         seasonal.served_fraction() * 100.0,
         format_kwh(seasonal.unmet_kwh),
         format_kwh(seasonal.load_kwh)
     );
     let _ = writeln!(
         out,
-        "- Governing month: {} ({:.1}% served, {} kWh unmet)",
+        "- Governing month: {} ({:.1}% served, {} unmet)",
         MONTH_NAMES[seasonal.worst_month],
         seasonal.worst_month_served_fraction() * 100.0,
         format_kwh(seasonal.worst_month_unmet_kwh)
     );
     let _ = writeln!(
         out,
-        "- Annual curtailed solar: {} kWh",
+        "- Annual curtailed solar: {}",
         format_kwh(seasonal.curtailed_kwh)
     );
 
@@ -966,7 +1028,7 @@ pub fn design_report_markdown(
         let _ = writeln!(out, "- Estimated capex: **US$ {:.0}**", rec.capex_usd);
         let _ = writeln!(
             out,
-            "- Achieved served fraction: {:.1}% ({} kWh unmet/year)",
+            "- Achieved served fraction: {:.1}% ({} unmet/year)",
             rec.served_fraction * 100.0,
             format_kwh(rec.unmet_kwh)
         );
@@ -992,11 +1054,9 @@ pub fn design_report_markdown(
 #[cfg(feature = "pro")]
 fn format_kwh(kwh: f64) -> String {
     if kwh >= 10_000.0 {
-        format!("{:.0} M", kwh / 1000.0)
-    } else if kwh >= 1000.0 {
-        format!("{:.1} k", kwh / 1000.0)
+        format!("{:.0} MWh", kwh / 1000.0)
     } else {
-        format!("{:.1}", kwh)
+        format!("{:.1} kWh", kwh)
     }
 }
 
@@ -1253,9 +1313,13 @@ mod tests {
     #[cfg(feature = "pro")]
     #[test]
     fn seasonal_winter_is_governing_month_southern_hemisphere() {
+        // Deliberately undersized so unmet energy is non-zero every month.
         let seasonal = simulate_seasonal(
             &Site::default(),
-            &SolarArray::default(),
+            &SolarArray {
+                capacity_kw: 2.0,
+                ..SolarArray::default()
+            },
             &BatterySpec::default(),
             &DayLoad::default(),
             &MonthlyFactors::default(),
@@ -1282,6 +1346,7 @@ mod tests {
         let rec = recommend_size(
             &Site::default(),
             &SolarArray::default(),
+            &BatterySpec::default(),
             &DayLoad::default(),
             &factors,
             &inputs,
@@ -1332,6 +1397,136 @@ mod tests {
         ] {
             assert!(report.contains(needle), "missing `{needle}`");
         }
-        assert_eq!(report.matches("| Month |").count(), 1);
+        assert!(report.contains("## Monthly factors"));
+        assert_eq!(report.matches("| Month |").count(), 2);
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn format_kwh_uses_correct_units() {
+        assert_eq!(format_kwh(512.34), "512.3 kWh");
+        assert_eq!(format_kwh(5_000.0), "5000.0 kWh");
+        assert_eq!(format_kwh(12_000.0), "12 MWh");
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn recommendation_respects_battery_template() {
+        let factors = MonthlyFactors::default();
+        let inputs = OptimizationInputs {
+            target_served_fraction: 0.95,
+            ..OptimizationInputs::default()
+        };
+        let run = |rte: f64| {
+            recommend_size(
+                &Site::default(),
+                &SolarArray::default(),
+                &BatterySpec {
+                    round_trip_efficiency: rte,
+                    ..BatterySpec::default()
+                },
+                &DayLoad::default(),
+                &factors,
+                &inputs,
+            )
+        };
+        let good = run(0.95);
+        let poor = run(0.60);
+        // A much lossier battery can never serve more load at the same size.
+        assert!(
+            poor.capex_usd >= good.capex_usd - 1e-9
+                || poor.unmet_kwh >= good.unmet_kwh - 1e-9,
+            "template efficiency had no effect"
+        );
+        assert!(poor.unmet_kwh != good.unmet_kwh || poor.capex_usd != good.capex_usd);
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn seasonal_is_independent_of_initial_soc() {
+        let run = |soc: f64| {
+            simulate_seasonal(
+                &Site::default(),
+                &SolarArray {
+                    capacity_kw: 2.0,
+                    ..SolarArray::default()
+                },
+                &BatterySpec {
+                    initial_soc: soc,
+                    ..BatterySpec::default()
+                },
+                &DayLoad::default(),
+                &MonthlyFactors::default(),
+            )
+        };
+        let (low, high) = (run(0.1), run(1.0));
+        assert!((low.unmet_kwh - high.unmet_kwh).abs() < 1e-3);
+    }
+
+    #[test]
+    fn validation_rejects_nan_and_out_of_range() {
+        let nan_battery = BatterySpec {
+            capacity_kwh: f64::NAN,
+            ..BatterySpec::default()
+        };
+        assert!(!nan_battery.validate().is_empty());
+        let low_init = BatterySpec {
+            min_soc: 0.5,
+            initial_soc: 0.2,
+            ..BatterySpec::default()
+        };
+        assert!(!low_init.validate().is_empty());
+        let neg_load = DayLoad {
+            hourly_kw: vec![-1.0; HOURS_PER_DAY],
+        };
+        assert!(!neg_load.validate().is_empty());
+        let short_load = DayLoad {
+            hourly_kw: vec![1.0; 12],
+        };
+        assert!(!short_load.validate().is_empty());
+        assert!(BatterySpec::default().validate().is_empty());
+    }
+
+    #[test]
+    fn zero_power_battery_behaves_like_no_battery() {
+        let solar = vec![0.0, 0.0, 5.0, 5.0];
+        let load = vec![1.0, 1.0, 1.0, 1.0];
+        let battery = BatterySpec {
+            capacity_kwh: 100.0,
+            power_kw: 0.0,
+            ..BatterySpec::default()
+        };
+        let totals = dispatch_profile(&solar, &load, &battery);
+        assert!((totals.unmet_kwh - 2.0).abs() < 1e-9);
+        assert!((totals.curtailed_kwh - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn negative_load_is_floored_and_energy_balances() {
+        let solar = vec![0.0, 3.0, 0.0];
+        let load = vec![-2.0, 1.0, 2.0];
+        let totals = dispatch_profile(&solar, &load, &BatterySpec::default());
+        assert!((totals.load_kwh - 3.0).abs() < 1e-9);
+        assert!(totals.unmet_kwh >= 0.0 && totals.curtailed_kwh >= 0.0);
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn infeasible_target_returns_best_effort() {
+        let inputs = OptimizationInputs {
+            // Served fraction can never exceed 1.0.
+            target_served_fraction: 1.5,
+            ..OptimizationInputs::default()
+        };
+        let rec = recommend_size(
+            &Site::default(),
+            &SolarArray::default(),
+            &BatterySpec::default(),
+            &DayLoad::default(),
+            &MonthlyFactors::default(),
+            &inputs,
+        );
+        assert!(!rec.feasible);
+        assert!(rec.capex_usd > 0.0);
     }
 }
