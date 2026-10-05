@@ -12,7 +12,7 @@ Two editions ship from this one codebase:
 single-day load/generation balance, one battery size |
 | **Pro** | `--features pro` | Paid desktop exe (Gumroad, $149): full
 seasonal (12-month) simulation, battery/generation sizing optimization,
-exportable system-design reports |
+exportable system-design reports. |
 
 ## Layout
 
