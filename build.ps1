@@ -56,6 +56,19 @@ $Crate = "tpt-app-microgrid-sizer"
 $Target = "wasm32-unknown-unknown"
 $OutName = "microgrid-sizer"
 
+# Validate the web repo the same way build.sh does: an existing directory with
+# a public/ folder. A wrong path would scatter the bundle into an unrelated
+# tree, so fail loudly before building anything.
+if ($WebRepo) {
+    if (-not (Test-Path -LiteralPath $WebRepo -PathType Container)) {
+        throw "web repo path does not exist or is not a directory: $WebRepo"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $WebRepo "public") -PathType Container)) {
+        throw "web repo path has no public\ directory: $WebRepo"
+    }
+    $WebRepo = (Resolve-Path -LiteralPath $WebRepo).Path
+}
+
 $HubDir = Join-Path $PSScriptRoot "dist\hub"
 $DesktopDir = Join-Path $PSScriptRoot "dist\desktop"
 $Dest = if ($WebRepo) { Join-Path $WebRepo "public\apps\microgrid-sizer" } else { $HubDir }
@@ -128,7 +141,11 @@ if ($Pro) {
         "",
         "Run tpt-microgrid-sizer-pro.exe.",
         "Requires Windows 10+ with the WebView2 runtime",
-        "(preinstalled on Windows 10 20H2+ and Windows 11)."
+        "(preinstalled on Windows 10 20H2+ and Windows 11).",
+        "",
+        "Licence: personal/organisational use - honour system, no key or",
+        "activation server. Please do not redistribute this download.",
+        "Source code: MIT OR Apache-2.0 (see LICENSE-MIT / LICENSE-APACHE)."
     )
     $zip = Join-Path $PSScriptRoot "release\TPT-Microgrid-Sizer-Pro.zip"
     Compress-Archive -Path $stageDir -DestinationPath $zip -Force

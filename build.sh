@@ -11,14 +11,43 @@ cd "$(dirname "$0")"
 PRO=0
 SKIP_BUILD=0
 WEB_REPO="${TPT_WEB_REPO:-}"
+# Positional/`-WebRepo` paths are only accepted when they look like a web repo
+# root: an existing directory that already carries the public/apps layout (or
+# at least a public/ directory). Guessing wrong here would scatter the bundle
+# into an unrelated tree, so a bad path is a hard error.
+WEB_REPO_ARG_SET=0
 for arg in "$@"; do
   case "$arg" in
     -Pro|--pro) PRO=1 ;;
     -SkipBuild|--skip-build) SKIP_BUILD=1 ;;
-    -WebRepo) : ;;
-    http*|/*|*) if [ -d "$arg" ] || [[ "$arg" != -* ]]; then WEB_REPO="${WEB_REPO:-$arg}"; fi ;;
+    -WebRepo|--web-repo) WEB_REPO_ARG_SET=1 ;;
+    -*) echo "unknown option: $arg" >&2; exit 2 ;;
+    *)
+      if [ "$WEB_REPO_ARG_SET" = 1 ]; then
+        WEB_REPO="$arg"
+        WEB_REPO_ARG_SET=0
+      elif [ -z "$WEB_REPO" ]; then
+        WEB_REPO="$arg"
+      else
+        echo "unexpected extra argument: $arg" >&2
+        exit 2
+      fi
+      ;;
   esac
 done
+
+if [ -n "$WEB_REPO" ]; then
+  if [ ! -d "$WEB_REPO" ]; then
+    echo "web repo path does not exist or is not a directory: $WEB_REPO" >&2
+    exit 2
+  fi
+  if [ ! -d "$WEB_REPO/public" ]; then
+    echo "web repo path has no public/ directory: $WEB_REPO" >&2
+    exit 2
+  fi
+  WEB_REPO="$(cd "$WEB_REPO" && pwd)"
+  echo "-- web repo: $WEB_REPO"
+fi
 
 CRATE="tpt-app-microgrid-sizer"
 TARGET="wasm32-unknown-unknown"

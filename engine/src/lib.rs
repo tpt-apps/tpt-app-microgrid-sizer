@@ -343,18 +343,90 @@ pub struct DispatchTotals {
     pub end_soc: f64,
 }
 
+/// Why a solar/load profile pair could not be dispatched.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProfileError {
+    /// The solar and load arrays describe different time spans.
+    LengthMismatch {
+        /// Number of hourly solar values supplied.
+        solar: usize,
+        /// Number of hourly load values supplied.
+        load: usize,
+    },
+    /// A value in either profile was NaN or infinite.
+    NotFinite {
+        /// Hour index of the offending value.
+        hour: usize,
+        /// Which profile it came from.
+        profile: &'static str,
+    },
+}
+
+impl core::fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LengthMismatch { solar, load } => write!(
+                f,
+                "the solar profile has {solar} hour(s) but the load profile has {load} \
+                 - both must cover the same period"
+            ),
+            Self::NotFinite { hour, profile } => {
+                write!(f, "{profile} value at hour {hour} is not a finite number")
+            }
+        }
+    }
+}
+
+impl ProfileError {
+    /// Checks a solar/load pair before dispatch. Previously a short solar
+    /// array was silently padded with zero sun, which reads as a dark-sky
+    /// result rather than a data-entry mistake.
+    pub fn check(solar_kw: &[f64], load_kw: &[f64]) -> Result<(), Self> {
+        if solar_kw.len() != load_kw.len() {
+            return Err(Self::LengthMismatch {
+                solar: solar_kw.len(),
+                load: load_kw.len(),
+            });
+        }
+        for (hour, value) in solar_kw.iter().chain(load_kw.iter()).enumerate() {
+            if !value.is_finite() {
+                let profile = if hour < solar_kw.len() {
+                    "solar"
+                } else {
+                    "load"
+                };
+                return Err(Self::NotFinite {
+                    hour: if hour < solar_kw.len() {
+                        hour
+                    } else {
+                        hour - solar_kw.len()
+                    },
+                    profile,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Runs the greedy hourly dispatch over arbitrary solar/load profiles and
 /// returns only the totals — the hand-checkable core primitive.
 ///
 /// Dispatch priority per hour: solar serves load directly; surplus charges
 /// the battery (then curtails); deficits discharge the battery (then go
 /// unmet). No grid connection.
+///
+/// # Errors
+/// [`ProfileError`] when the two profiles cover different periods or carry a
+/// non-finite value — dispatching mismatched arrays would otherwise report a
+/// plausible but meaningless balance.
 pub fn dispatch_profile(
     solar_kw: &[f64],
     load_kw: &[f64],
     battery: &BatterySpec,
-) -> DispatchTotals {
-    dispatch_hours(solar_kw, load_kw, battery).1
+) -> Result<DispatchTotals, ProfileError> {
+    ProfileError::check(solar_kw, load_kw)?;
+    Ok(dispatch_hours(solar_kw, load_kw, battery).1)
 }
 
 /// Internal hourly dispatch returning the full trajectory.
@@ -851,6 +923,85 @@ fn generator_energy_kwh(hours: &[HourPoint], generator: &GeneratorSpec) -> f64 {
         .sum()
 }
 
+/// Result of the multi-day overcast ("cloudy spell") endurance check.
+#[cfg(feature = "pro")]
+#[derive(Debug, Clone)]
+pub struct SpellResult {
+    /// Month whose weather the spell was taken from (the governing month of
+    /// the annual run — least solar, most load).
+    pub month: usize,
+    /// Consecutive days of the spell simulated (1-60).
+    pub days_simulated: usize,
+    /// Zero-based day index on which load first went unserved; equals
+    /// `days_simulated` when the whole spell was covered (see `survived`).
+    pub days_to_failure: usize,
+    /// `true` when the whole spell was covered without unmet energy.
+    pub survived: bool,
+    /// Unmet energy over the whole spell, kWh.
+    pub unmet_kwh: f64,
+    /// Load served over the whole spell, kWh.
+    pub served_kwh: f64,
+}
+
+/// Simulates `days` back-to-back days of the worst month's weather, starting
+/// from a full battery, carrying the SoC across the days.
+///
+/// The seasonal model runs each month to a steady-state SoC cycle, so it
+/// cannot see a long run of overcast days draining a battery that never gets
+/// a chance to recharge — the classic optimistic failure for off-grid sites.
+/// This check answers "how many dark days can this design ride out?".
+#[cfg(feature = "pro")]
+pub fn simulate_cloudy_spell(
+    site: &Site,
+    array: &SolarArray,
+    battery: &BatterySpec,
+    base_load: &DayLoad,
+    factors: &MonthlyFactors,
+    seasonal: &SeasonalResult,
+    days: usize,
+) -> SpellResult {
+    const MAX_SPELL_DAYS: usize = 60;
+    let days_simulated = days.clamp(1, MAX_SPELL_DAYS);
+    let month = seasonal.worst_month;
+    let spell_array = SolarArray {
+        cloud_factor: factors.cloud[month],
+        ambient_celsius: factors.ambient_c[month],
+        ..array.clone()
+    };
+    let spell_load = base_load.scaled(factors.load[month]);
+    let solar = solar_profile_kw(site, &spell_array, month);
+
+    // A spell always starts from a charged battery — that is the design
+    // margin the check is asking about.
+    let mut spec = battery.clamped();
+    spec.initial_soc = 1.0;
+    let mut served_kwh = 0.0;
+    let mut unmet_kwh = 0.0;
+    let mut days_to_failure = days_simulated;
+
+    for day in 0..days_simulated {
+        let (_, totals) = dispatch_hours(&solar, &spell_load.hourly_kw, &spec);
+        let unmet_day = totals.unmet_kwh;
+        served_kwh += totals.load_kwh - unmet_day;
+        unmet_kwh += unmet_day;
+        if unmet_day > 1e-9 && day < days_to_failure {
+            days_to_failure = day;
+        }
+        // Carry the SoC into the next day; once the battery is flat this
+        // keeps running so the caller sees the whole spell's unmet energy.
+        spec.initial_soc = totals.end_soc;
+    }
+
+    SpellResult {
+        month,
+        days_simulated,
+        days_to_failure,
+        survived: unmet_kwh <= 1e-9,
+        unmet_kwh,
+        served_kwh,
+    }
+}
+
 /// Cost and target inputs for the sizing optimization.
 #[derive(Debug, Clone)]
 pub struct OptimizationInputs {
@@ -873,6 +1024,57 @@ pub struct OptimizationInputs {
     pub battery_life_years: f64,
     /// Optional backup generator included in every candidate design.
     pub generator: Option<GeneratorSpec>,
+    /// What the sizing search minimises among the feasible candidates.
+    /// Installed capital is the historic default; annualised cost (LCOE's
+    /// numerator) is the engineering-preferred view because it prices
+    /// generator fuel and battery replacements.
+    pub objective: OptimizationObjective,
+}
+
+/// What [`recommend_size`] minimises among feasible candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptimizationObjective {
+    /// Cheapest installed capital (USD).
+    Capex,
+    /// Cheapest levelised annual cost (USD/year) — capex annualised with the
+    /// capital recovery factor, plus O&M, battery replacements and generator
+    /// fuel. The default.
+    #[default]
+    AnnualCost,
+    /// Cheapest levelised cost of energy (USD per kWh served). Same annual
+    /// cost as [`Self::AnnualCost`], normalised by the energy each candidate
+    /// actually serves — favours slightly larger arrays that trim the tail.
+    Lcoe,
+}
+
+impl OptimizationObjective {
+    /// Stable identifier used by the UI select and persisted in reports.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Capex => "capex",
+            Self::AnnualCost => "annual-cost",
+            Self::Lcoe => "lcoe",
+        }
+    }
+
+    /// Parses [`Self::id`], falling back to the default (as the UI does when
+    /// a stored scenario holds an unknown value).
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "capex" => Self::Capex,
+            "lcoe" => Self::Lcoe,
+            _ => Self::AnnualCost,
+        }
+    }
+
+    /// Human-readable label for the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Capex => "Lowest installed cost (capex)",
+            Self::AnnualCost => "Lowest levelised annual cost",
+            Self::Lcoe => "Lowest cost of energy (LCOE)",
+        }
+    }
 }
 
 impl Default for OptimizationInputs {
@@ -887,6 +1089,7 @@ impl Default for OptimizationInputs {
             om_fraction_of_capex: 0.015,
             battery_life_years: 10.0,
             generator: None,
+            objective: OptimizationObjective::default(),
         }
     }
 }
@@ -1011,6 +1214,22 @@ pub fn recommend_size(
 
     let mut best_feasible: Option<SizingRecommendation> = None;
     let mut best_effort: Option<SizingRecommendation> = None;
+    // Lower is better for whichever metric the caller chose; ties always fall
+    // back to unmet energy so the choice is deterministic.
+    let score = |c: &SizingRecommendation| match inputs.objective {
+        OptimizationObjective::Capex => c.capex_usd,
+        OptimizationObjective::AnnualCost => c.annual_cost_usd,
+        OptimizationObjective::Lcoe => c.lcoe_usd_per_kwh,
+    };
+    let better = |candidate: &SizingRecommendation, best: &SizingRecommendation| {
+        let (cand_score, best_score) = (score(candidate), score(best));
+        cand_score < best_score - 1e-9
+            || ((cand_score - best_score).abs() <= 1e-9
+                && candidate.unmet_kwh < best.unmet_kwh - 1e-9)
+            || ((cand_score - best_score).abs() <= 1e-9
+                && (candidate.unmet_kwh - best.unmet_kwh).abs() <= 1e-9
+                && candidate.capex_usd < best.capex_usd)
+    };
 
     for &pv_mult in &PV_MULTIPLIERS {
         let solar_kw = (peak_kw * pv_mult).max(0.05);
@@ -1058,22 +1277,14 @@ pub fn recommend_size(
                 lcoe_usd_per_kwh: lcoe,
             };
             let better_feasible = match &best_feasible {
-                Some(best) => {
-                    candidate.capex_usd < best.capex_usd - 1e-9
-                        || ((candidate.capex_usd - best.capex_usd).abs() <= 1e-9
-                            && candidate.unmet_kwh < best.unmet_kwh)
-                }
+                Some(best) => better(&candidate, best),
                 None => candidate.feasible,
             };
             if candidate.feasible && better_feasible {
                 best_feasible = Some(candidate.clone());
             }
             let better_effort = match &best_effort {
-                Some(best) => {
-                    candidate.unmet_kwh < best.unmet_kwh - 1e-9
-                        || ((candidate.unmet_kwh - best.unmet_kwh).abs() <= 1e-9
-                            && candidate.capex_usd < best.capex_usd)
-                }
+                Some(best) => better(&candidate, best),
                 None => true,
             };
             if better_effort {
@@ -1087,9 +1298,23 @@ pub fn recommend_size(
         .expect("the search grid is never empty")
 }
 
-/// Builds the exportable system-design report (Markdown) for a simulated
-/// design. `recommendation` is included when the optimizer has run.
+/// The optional extras a design report can carry. Grouped into one argument so
+/// [`design_report_markdown`] stays within a readable parameter count.
 #[cfg(feature = "pro")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReportExtras<'a> {
+    /// The optimizer's recommendation, when it has run.
+    pub recommendation: Option<&'a SizingRecommendation>,
+    /// The cost assumptions behind the LCOE, so it can be reproduced.
+    pub cost_inputs: Option<&'a OptimizationInputs>,
+    /// The multi-day overcast endurance check.
+    pub spell: Option<&'a SpellResult>,
+}
+
+/// Builds the exportable system-design report (Markdown) for a simulated
+/// design. See [`ReportExtras`] for the optional sections.
+#[cfg(feature = "pro")]
+#[allow(clippy::too_many_arguments)]
 pub fn design_report_markdown(
     site: &Site,
     array: &SolarArray,
@@ -1097,9 +1322,15 @@ pub fn design_report_markdown(
     base_load: &DayLoad,
     factors: &MonthlyFactors,
     seasonal: &SeasonalResult,
-    recommendation: Option<&SizingRecommendation>,
+    extras: ReportExtras<'_>,
 ) -> String {
     use std::fmt::Write as _;
+
+    let ReportExtras {
+        recommendation,
+        cost_inputs,
+        spell,
+    } = extras;
 
     let mut out = String::new();
     out.push_str("# TPT Microgrid Sizer — System Design Report\n\n");
@@ -1200,6 +1431,32 @@ pub fn design_report_markdown(
         );
     }
 
+    if let Some(spell) = spell {
+        let _ = writeln!(
+            out,
+            "\n- Overcast endurance ({} days of {} weather, battery full at the start): {}",
+            spell.days_simulated,
+            MONTH_NAMES[spell.month],
+            if spell.survived {
+                format!(
+                    "fully covered ({} served, no unmet energy)",
+                    format_kwh(spell.served_kwh)
+                )
+            } else if spell.days_to_failure == 0 {
+                format!(
+                    "load unmet on the very first day, {} unmet over the spell",
+                    format_kwh(spell.unmet_kwh)
+                )
+            } else {
+                format!(
+                    "load first unmet after {} day(s); {} unmet over the spell",
+                    spell.days_to_failure,
+                    format_kwh(spell.unmet_kwh)
+                )
+            }
+        );
+    }
+
     if let Some(rec) = recommendation {
         out.push_str("\n## Recommended sizing\n\n");
         let _ = writeln!(out, "- Solar array: **{:.1} kWp**", rec.solar_kw);
@@ -1227,6 +1484,48 @@ pub fn design_report_markdown(
                  or adding a backup generator.\n",
             );
         }
+    }
+
+    if let Some(inputs) = cost_inputs {
+        out.push_str("\n## Cost basis\n\n");
+        let _ = writeln!(out, "- PV installed cost: US$ {:.0}/kWp", inputs.pv_cost_usd_per_kw);
+        let _ = writeln!(
+            out,
+            "- Battery installed cost: US$ {:.0}/kWh nameplate",
+            inputs.battery_cost_usd_per_kwh
+        );
+        let _ = writeln!(
+            out,
+            "- Discount rate: {:.1}%; project life: {:.0} years; battery replacement: every {:.0} years",
+            inputs.discount_rate * 100.0,
+            inputs.project_years,
+            inputs.battery_life_years
+        );
+        let _ = writeln!(
+            out,
+            "- O&M: {:.1}% of capex per year",
+            inputs.om_fraction_of_capex * 100.0
+        );
+        match &inputs.generator {
+            Some(g) => {
+                let _ = writeln!(
+                    out,
+                    "- Backup generator: {:.1} kW at US$ {:.0}/kW installed, {:.2} L/kWh, fuel US$ {:.2}/L",
+                    g.power_kw,
+                    g.cost_usd_per_kw,
+                    g.fuel_l_per_kwh,
+                    g.fuel_cost_usd_per_l
+                );
+            }
+            None => out.push_str("- Backup generator: none included.\n"),
+        }
+        let _ = writeln!(
+            out,
+            "- Target served fraction: {:.1}%; battery power rating {:.2} kW/kWh",
+            inputs.target_served_fraction * 100.0,
+            inputs.battery_power_ratio
+        );
+        let _ = writeln!(out, "- Sizing objective: {}", inputs.objective.label());
     }
 
     out.push_str("\n## Assumptions\n\n");
@@ -1275,12 +1574,19 @@ mod tests {
         }
     }
 
+    /// `dispatch_profile` with the length/finite check unwrapped — the tests
+    /// below all supply matching, finite 24-hour profiles, and the check
+    /// itself is covered by `profile_length_mismatch_is_an_error`.
+    fn dispatch(solar_kw: &[f64], load_kw: &[f64], battery: &BatterySpec) -> DispatchTotals {
+        dispatch_profile(solar_kw, load_kw, battery).expect("test profiles are valid")
+    }
+
     /// Hand-checkable balance, generation side zeroed: a constant 2 kW load
     /// against a 10 kWh battery (RTE 1.0, full) must empty it in exactly
     /// five hours and then go unmet — 10 kWh served, 38 kWh unmet.
     #[test]
     fn battery_only_dispatch_hand_check() {
-        let totals = dispatch_profile(&[0.0; 24], &vec![2.0; 24], &full_battery());
+        let totals = dispatch(&[0.0; 24], &[2.0; 24], &full_battery());
         assert!((totals.load_kwh - 48.0).abs() < 1e-6);
         assert!((totals.solar_kwh).abs() < 1e-9);
         assert!((totals.discharged_kwh - 10.0).abs() < 1e-6);
@@ -1316,7 +1622,7 @@ mod tests {
         solar[0] = 2.0;
         solar[1] = 2.0;
         solar[2] = 2.0;
-        let totals = dispatch_profile(&solar, &[0.0; 24], &battery);
+        let totals = dispatch(&solar, &[0.0; 24], &battery);
         assert!((totals.charged_kwh - 6.0).abs() < 1e-9, "{}", totals.charged_kwh);
         assert!((totals.curtailed_kwh).abs() < 1e-9);
         assert!((totals.end_soc - 0.54).abs() < 1e-9, "{}", totals.end_soc);
@@ -1342,7 +1648,7 @@ mod tests {
         for kw in load.iter_mut().skip(3) {
             *kw = 3.0;
         }
-        let totals = dispatch_profile(&solar, &load, &battery);
+        let totals = dispatch(&solar, &load, &battery);
         // 21 deficit hours × 3 kW = 63 kWh of load; the stored 5.4 kWh
         // delivers 4.86 kWh grid-side.
         assert!((totals.load_kwh - 63.0).abs() < 1e-6, "{}", totals.load_kwh);
@@ -1362,7 +1668,7 @@ mod tests {
             min_soc: 0.0,
             initial_soc: 0.0,
         };
-        let totals = dispatch_profile(&[4.0; 24], &[0.0; 24], &battery);
+        let totals = dispatch(&[4.0; 24], &[0.0; 24], &battery);
         assert!((totals.charged_kwh - 48.0).abs() < 1e-9);
         assert!((totals.curtailed_kwh - 48.0).abs() < 1e-9);
     }
@@ -1378,7 +1684,7 @@ mod tests {
             min_soc: 0.1,
             initial_soc: 1.0,
         };
-        let totals = dispatch_profile(&[0.0; 24], &vec![50.0; 24], &battery);
+        let totals = dispatch(&[0.0; 24], &[50.0; 24], &battery);
         assert!((totals.discharged_kwh - 9.0).abs() < 1e-6, "{}", totals.discharged_kwh);
         assert!((totals.end_soc - 0.1).abs() < 1e-6);
     }
@@ -1392,7 +1698,7 @@ mod tests {
         };
         let solar = [3.0; 24];
         let load = vec![1.0; 12].into_iter().chain(vec![5.0; 12]).collect::<Vec<_>>();
-        let totals = dispatch_profile(&solar, &load, &battery);
+        let totals = dispatch(&solar, &load, &battery);
         assert!((totals.unmet_kwh - 24.0).abs() < 1e-9);
         assert!((totals.curtailed_kwh - 24.0).abs() < 1e-9);
     }
@@ -1574,7 +1880,7 @@ mod tests {
             &DayLoad::default(),
             &MonthlyFactors::default(),
             &seasonal,
-            None,
+            ReportExtras::default(),
         );
         for needle in [
             "# TPT Microgrid Sizer",
@@ -1587,6 +1893,78 @@ mod tests {
         }
         assert!(report.contains("## Monthly factors"));
         assert_eq!(report.matches("| Month |").count(), 2);
+    }
+
+    /// A short solar array is a data-entry error, not a sunless day: the
+    /// dispatch refuses the pair instead of silently padding with zeros.
+    #[test]
+    fn profile_length_mismatch_is_an_error() {
+        let err = dispatch_profile(&[1.0, 2.0, 3.0], &[1.0; 24], &full_battery())
+            .expect_err("mismatched profile lengths must be rejected");
+        assert_eq!(
+            err,
+            ProfileError::LengthMismatch {
+                solar: 3,
+                load: 24
+            }
+        );
+        assert!(err.to_string().contains("24"));
+
+        let err = dispatch_profile(&[f64::NAN, 0.0], &[0.0, 0.0], &full_battery())
+            .expect_err("non-finite solar must be rejected");
+        assert_eq!(
+            err,
+            ProfileError::NotFinite {
+                hour: 0,
+                profile: "solar"
+            }
+        );
+
+        let err = dispatch_profile(&[0.0, 0.0], &[0.0, f64::INFINITY], &full_battery())
+            .expect_err("non-finite load must be rejected");
+        assert_eq!(
+            err,
+            ProfileError::NotFinite {
+                hour: 1,
+                profile: "load"
+            }
+        );
+
+        // Matching finite profiles still dispatch.
+        assert!(dispatch_profile(&[0.0; 24], &[0.0; 24], &full_battery()).is_ok());
+    }
+
+    /// `solar_profile_kw` and the load profile always cover the same period,
+    /// which is exactly what `ProfileError` guards at the public entry point.
+    #[test]
+    fn solar_and_load_profiles_are_the_same_length() {
+        let site = Site::default();
+        for m in 0..MONTHS_PER_YEAR {
+            let solar = solar_profile_kw(&site, &SolarArray::default(), m);
+            let load = constant_load(1.0).hourly_kw;
+            assert_eq!(solar.len(), load.len(), "month {m}");
+            assert!(ProfileError::check(&solar, &load).is_ok(), "month {m}");
+        }
+    }
+
+    /// The free build must not expose the Pro surface. This test only runs in
+    /// the free configuration, and it fails the moment the pro feature flag is
+    /// switched on for the shipped WASM bundle.
+    #[cfg(not(feature = "pro"))]
+    #[test]
+    fn free_build_excludes_pro_surface() {
+        // Single-day balance is available in both editions.
+        let day = simulate_day(
+            &Site::default(),
+            &SolarArray::default(),
+            &BatterySpec::default(),
+            &constant_load(1.0),
+            0,
+        );
+        assert!((day.totals.load_kwh - 24.0).abs() < 1e-9);
+        assert_eq!(day.hours.len(), HOURS_PER_DAY);
+        // The pro feature flag must be off for this compilation.
+        assert!(!cfg!(feature = "pro"));
     }
 
     #[cfg(feature = "pro")]
@@ -1684,7 +2062,7 @@ mod tests {
             power_kw: 0.0,
             ..BatterySpec::default()
         };
-        let totals = dispatch_profile(&solar, &load, &battery);
+        let totals = dispatch(&solar, &load, &battery);
         assert!((totals.unmet_kwh - 2.0).abs() < 1e-9);
         assert!((totals.curtailed_kwh - 8.0).abs() < 1e-9);
     }
@@ -1693,7 +2071,7 @@ mod tests {
     fn negative_load_is_floored_and_energy_balances() {
         let solar = vec![0.0, 3.0, 0.0];
         let load = vec![-2.0, 1.0, 2.0];
-        let totals = dispatch_profile(&solar, &load, &BatterySpec::default());
+        let totals = dispatch(&solar, &load, &BatterySpec::default());
         assert!((totals.load_kwh - 3.0).abs() < 1e-9);
         assert!(totals.unmet_kwh >= 0.0 && totals.curtailed_kwh >= 0.0);
     }
@@ -1811,5 +2189,430 @@ mod tests {
             ..GeneratorSpec::default()
         };
         assert!(!bad.validate().is_empty());
+    }
+
+    /// Fractional UTC offsets (ACST +9:30, Nepal +5:45, Chatham +12:45) shift
+    /// the solar profile but must never produce NaN or a negative yield.
+    #[test]
+    fn fractional_utc_offsets_simulate_sensibly() {
+        for offset in [9.5, 5.75, 12.75, -3.5] {
+            let site = Site {
+                timezone_offset_hours: offset,
+                ..Site::default()
+            };
+            let profile = solar_profile_kw(&site, &SolarArray::default(), 0);
+            assert_eq!(profile.len(), HOURS_PER_DAY, "offset {offset}");
+            assert!(
+                profile.iter().all(|k| k.is_finite() && *k >= 0.0),
+                "offset {offset} produced {profile:?}"
+            );
+            assert!(
+                profile.iter().sum::<f64>() > 0.0,
+                "offset {offset} produced no energy at all"
+            );
+        }
+    }
+
+    /// Panel orientation: the same 0° (north) array out-produces itself in the
+    /// southern hemisphere, and a due-south array beats due-north in the north.
+    #[test]
+    fn panel_orientation_changes_yield() {
+        let southern = Site {
+            latitude_deg: -41.3,
+            ..Site::default()
+        };
+        let northern = Site {
+            latitude_deg: 52.4,
+            longitude_deg: 4.9,
+            ..Site::default()
+        };
+        let energy = |site: &Site, array: &SolarArray, month: usize| -> f64 {
+            solar_profile_kw(site, array, month).iter().sum()
+        };
+        let north_facing = SolarArray::default();
+        // December at both sites, same array and azimuth.
+        let wellington_december = energy(&southern, &north_facing, 11);
+        let amsterdam_december = energy(&northern, &north_facing, 11);
+        assert!(wellington_december > 0.0 && amsterdam_december > 0.0);
+        assert!(
+            wellington_december > amsterdam_december,
+            "a 0° azimuth in the southern hemisphere should beat one in the north"
+        );
+        // And a due-south array in Amsterdam beats due-north there.
+        let amsterdam_south = energy(
+            &northern,
+            &SolarArray {
+                azimuth_deg: 180.0,
+                ..SolarArray::default()
+            },
+            11,
+        );
+        assert!(amsterdam_south > amsterdam_december);
+    }
+
+    /// The seasonal year is a fixed 365-day representative year: February is
+    /// scaled by 28 days and the monthly loads must sum to the annual total.
+    #[cfg(feature = "pro")]
+    #[test]
+    fn month_day_scaling_sums_to_the_year() {
+        let seasonal = simulate_seasonal_with_generator(
+            &Site::default(),
+            &SolarArray::default(),
+            &BatterySpec::default(),
+            &constant_load(1.0),
+            &MonthlyFactors::flat(),
+            None,
+        );
+        assert_eq!(seasonal.months.len(), MONTHS_PER_YEAR);
+        let summed: f64 = seasonal.months.iter().map(|m| m.load_kwh).sum();
+        // 365 days x 24 h x 1 kW.
+        assert!((summed - 8760.0).abs() < 1e-6, "{summed}");
+        assert!((seasonal.load_kwh - 8760.0).abs() < 1e-6);
+        assert!((seasonal.months[1].load_kwh - 672.0).abs() < 1e-6, "February");
+    }
+/// A multi-day overcast spell is stricter than the steady-state seasonal
+    /// month it is drawn from, and its reported failure day is consistent with
+    /// the unmet energy seen.
+    #[cfg(feature = "pro")]
+    #[test]
+    fn cloudy_spell_is_harsher_than_the_steady_month() {
+        let site = Site::default();
+        let array = SolarArray {
+            capacity_kw: 3.0,
+            ..SolarArray::default()
+        };
+        let battery = BatterySpec {
+            capacity_kwh: 6.0,
+            power_kw: 3.0,
+            round_trip_efficiency: 0.9,
+            min_soc: 0.1,
+            initial_soc: 1.0,
+        };
+        let load = constant_load(1.5);
+        let factors = MonthlyFactors::flat();
+        let seasonal =
+            simulate_seasonal_with_generator(&site, &array, &battery, &load, &factors, None);
+
+        // An undersized design cannot survive a week of the worst month.
+        let spell = simulate_cloudy_spell(&site, &array, &battery, &load, &factors, &seasonal, 7);
+        assert_eq!(spell.days_simulated, 7);
+        assert_eq!(spell.month, seasonal.worst_month);
+        assert!(
+            !spell.survived,
+            "a 6 kWh battery cannot ride out a 7-day winter spell"
+        );
+        assert!(spell.days_to_failure < 7);
+        assert!(spell.unmet_kwh > 0.0);
+        assert!(spell.served_kwh > 0.0);
+        // Every day is still logged, so served + unmet equals the whole load.
+        let spell_load_kwh = load.daily_kwh() * factors.load[spell.month] * 7.0;
+        assert!(
+            ((spell.served_kwh + spell.unmet_kwh) - spell_load_kwh).abs() < 1e-6,
+            "{} vs {}",
+            spell.served_kwh + spell.unmet_kwh,
+            spell_load_kwh
+        );
+
+        // A generous design does survive the same spell: 300 kWh covers the
+        // worst-month deficit for the whole week.
+        let big = BatterySpec {
+            capacity_kwh: 300.0,
+            power_kw: 20.0,
+            ..battery.clone()
+        };
+        let big_seasonal =
+            simulate_seasonal_with_generator(&site, &array, &big, &load, &factors, None);
+        let survives =
+            simulate_cloudy_spell(&site, &array, &big, &load, &factors, &big_seasonal, 7);
+        assert!(survives.survived, "{survives:?}");
+        assert_eq!(survives.days_to_failure, 7);
+
+        // The day count is clamped into a sane range.
+        let clamped =
+            simulate_cloudy_spell(&site, &array, &big, &load, &factors, &big_seasonal, 0);
+        assert_eq!(clamped.days_simulated, 1);
+        let long =
+            simulate_cloudy_spell(&site, &array, &big, &load, &factors, &big_seasonal, 999);
+        assert_eq!(long.days_simulated, 60);
+    }
+
+    /// The optimizer honours the requested objective: minimising LCOE returns
+    /// a candidate at least as cheap per kWh as the capex-optimal one, and the
+    /// objective ids round-trip.
+    #[cfg(feature = "pro")]
+    #[test]
+    fn optimizer_objective_selects_the_requested_metric() {
+        let site = Site::default();
+        let array = SolarArray {
+            capacity_kw: 3.0,
+            ..SolarArray::default()
+        };
+        let battery = BatterySpec {
+            capacity_kwh: 10.0,
+            power_kw: 5.0,
+            round_trip_efficiency: 0.9,
+            min_soc: 0.1,
+            initial_soc: 0.5,
+        };
+        let load = constant_load(1.2);
+        let factors = MonthlyFactors::flat();
+        let base = OptimizationInputs {
+            target_served_fraction: 0.95,
+            generator: None,
+            ..OptimizationInputs::default()
+        };
+
+        let by_capex = recommend_size(
+            &site,
+            &array,
+            &battery,
+            &load,
+            &factors,
+            &OptimizationInputs {
+                objective: OptimizationObjective::Capex,
+                ..base.clone()
+            },
+        );
+        let by_lcoe = recommend_size(
+            &site,
+            &array,
+            &battery,
+            &load,
+            &factors,
+            &OptimizationInputs {
+                objective: OptimizationObjective::Lcoe,
+                ..base.clone()
+            },
+        );
+        assert!(by_capex.feasible && by_lcoe.feasible);
+        assert!(
+            by_lcoe.lcoe_usd_per_kwh <= by_capex.lcoe_usd_per_kwh + 1e-9,
+            "LCOE objective {} worse than capex objective {}",
+            by_lcoe.lcoe_usd_per_kwh,
+            by_capex.lcoe_usd_per_kwh
+        );
+        // More energy costs more capital.
+        assert!(by_lcoe.capex_usd >= by_capex.capex_usd - 1e-6);
+        // Both still meet the target they were given.
+        assert!(by_lcoe.served_fraction >= base.target_served_fraction);
+
+        for objective in [
+            OptimizationObjective::Capex,
+            OptimizationObjective::AnnualCost,
+            OptimizationObjective::Lcoe,
+        ] {
+            assert_eq!(
+                OptimizationObjective::from_id(objective.id()),
+                objective,
+                "{}",
+                objective.id()
+            );
+            assert!(!objective.label().is_empty());
+        }
+        assert_eq!(
+            OptimizationObjective::from_id("nonsense"),
+            OptimizationObjective::AnnualCost
+        );
+        assert_eq!(
+            OptimizationInputs::default().objective,
+            OptimizationObjective::AnnualCost
+        );
+    }
+
+    /// The report documents the cost basis and generator settings, so a reader
+    /// can reproduce the LCOE, and prints real site values rather than just
+    /// headings.
+    #[cfg(feature = "pro")]
+    #[test]
+    fn report_documents_costs_and_generator() {
+        let site = Site::default();
+        let array = SolarArray {
+            capacity_kw: 4.0,
+            ..SolarArray::default()
+        };
+        let battery = BatterySpec {
+            capacity_kwh: 12.0,
+            power_kw: 5.0,
+            min_soc: 0.1,
+            initial_soc: 0.6,
+            ..BatterySpec::default()
+        };
+        let load = constant_load(1.4);
+        let factors = MonthlyFactors::flat();
+        let seasonal =
+            simulate_seasonal_with_generator(&site, &array, &battery, &load, &factors, None);
+        let inputs = OptimizationInputs {
+            pv_cost_usd_per_kw: 1250.0,
+            battery_cost_usd_per_kwh: 550.0,
+            discount_rate: 0.06,
+            project_years: 25.0,
+            battery_life_years: 12.0,
+            om_fraction_of_capex: 0.02,
+            target_served_fraction: 0.98,
+            battery_power_ratio: 0.4,
+            generator: Some(GeneratorSpec {
+                power_kw: 8.0,
+                fuel_l_per_kwh: 0.32,
+                fuel_cost_usd_per_l: 1.8,
+                cost_usd_per_kw: 500.0,
+            }),
+            objective: OptimizationObjective::Lcoe,
+        };
+        let rec = recommend_size(&site, &array, &battery, &load, &factors, &inputs);
+        let report = design_report_markdown(
+            &site,
+            &array,
+            &battery,
+            &load,
+            &factors,
+            &seasonal,
+            ReportExtras {
+                recommendation: Some(&rec),
+                cost_inputs: Some(&inputs),
+                spell: None,
+            },
+        );
+
+        // Site, array and battery values are printed, not just the headings.
+        assert!(report.contains(&format!("{:.4}", site.latitude_deg.abs())), "{report}");
+        assert!(report.contains("UTC+12.0"), "{report}");
+        assert!(report.contains(&format!("{:.1} kWp DC", array.capacity_kw)));
+        assert!(report.contains("initial SoC 60%"), "{report}");
+        assert!(report.contains(&format!("{:.1} kWh nameplate", battery.capacity_kwh)));
+
+        assert!(report.contains("## Cost basis"), "{report}");
+        assert!(report.contains("US$ 1250/kWp"));
+        assert!(report.contains("US$ 550/kWh nameplate"));
+        assert!(report.contains("Discount rate: 6.0%"));
+        assert!(report.contains("project life: 25 years"));
+        assert!(report.contains("every 12 years"));
+        assert!(report.contains("O&M: 2.0% of capex"));
+        assert!(report.contains("Backup generator: 8.0 kW at US$ 500/kW"));
+        assert!(report.contains("fuel US$ 1.80/L"));
+        assert!(report.contains("Target served fraction: 98.0%"));
+        assert!(report.contains("0.40 kW/kWh"));
+        assert!(report.contains("Lowest cost of energy (LCOE)"));
+
+        assert!(report.contains("## Recommended sizing"));
+        assert!(report.contains(&format!("US$ {:.0}/year", rec.annual_cost_usd)));
+        assert!(report.contains(&format!("US$ {:.0}", rec.capex_usd)));
+        // Every month appears in both tables.
+        assert_eq!(report.matches("| January |").count(), 2);
+        // MWh formatting kicks in for annual totals.
+        assert!(report.contains("MWh"), "{report}");
+
+        // Without cost inputs the section is simply absent.
+        let bare = design_report_markdown(
+            &site,
+            &array,
+            &battery,
+            &load,
+            &factors,
+            &seasonal,
+            ReportExtras::default(),
+        );
+        assert!(!bare.contains("## Cost basis"));
+        assert!(!bare.contains("## Recommended sizing"));
+        assert!(bare.contains("## Assumptions"));
+        // A generator-less input set says so explicitly.
+        let no_gen = OptimizationInputs {
+            generator: None,
+            ..inputs.clone()
+        };
+        let report = design_report_markdown(
+            &site,
+            &array,
+            &battery,
+            &load,
+            &factors,
+            &seasonal,
+            ReportExtras {
+                cost_inputs: Some(&no_gen),
+                ..ReportExtras::default()
+            },
+        );
+        assert!(report.contains("Backup generator: none included."), "{report}");
+    }
+
+    /// The overcast line is written correctly for all three spell outcomes:
+    /// survived, failed on day one, and failed part-way through.
+    #[cfg(feature = "pro")]
+    #[test]
+    fn report_writes_every_spell_outcome() {
+        let site = Site::default();
+        let array = SolarArray {
+            capacity_kw: 2.0,
+            ..SolarArray::default()
+        };
+        let load = constant_load(2.0);
+        let factors = MonthlyFactors::flat();
+        let spell_report = |battery: &BatterySpec, days: usize| -> (SpellResult, String) {
+            let seasonal =
+                simulate_seasonal_with_generator(&site, &array, battery, &load, &factors, None);
+            let spell =
+                simulate_cloudy_spell(&site, &array, battery, &load, &factors, &seasonal, days);
+            let report = design_report_markdown(
+                &site,
+                &array,
+                battery,
+                &load,
+                &factors,
+                &seasonal,
+                ReportExtras {
+                    spell: Some(&spell),
+                    ..ReportExtras::default()
+                },
+            );
+            (spell, report)
+        };
+
+        // Survives: a battery far larger than the load.
+        let big = BatterySpec {
+            capacity_kwh: 200.0,
+            power_kw: 20.0,
+            min_soc: 0.05,
+            initial_soc: 1.0,
+            ..BatterySpec::default()
+        };
+        let (spell, report) = spell_report(&big, 3);
+        assert!(spell.survived, "{spell:?}");
+        assert!(report.contains("Overcast endurance (3 days of"), "{report}");
+        assert!(report.contains("fully covered"), "{report}");
+
+        // Fails on day one: no battery at all.
+        let none = BatterySpec {
+            capacity_kwh: 0.0,
+            power_kw: 0.0,
+            ..BatterySpec::default()
+        };
+        let (spell, report) = spell_report(&none, 3);
+        assert!(!spell.survived && spell.days_to_failure == 0, "{spell:?}");
+        assert!(report.contains("unmet on the very first day"), "{report}");
+
+        // Fails part-way through: enough for day one, not for the whole spell.
+        let mid = BatterySpec {
+            capacity_kwh: 120.0,
+            power_kw: 5.0,
+            min_soc: 0.1,
+            initial_soc: 1.0,
+            ..BatterySpec::default()
+        };
+        let (spell, report) = spell_report(&mid, 5);
+        assert!(!spell.survived && spell.days_to_failure > 0, "{spell:?}");
+        assert!(report.contains("load first unmet after"), "{report}");
+
+        // With no spell the line is absent.
+        let seasonal =
+            simulate_seasonal_with_generator(&site, &array, &mid, &load, &factors, None);
+        let bare = design_report_markdown(
+            &site,
+            &array,
+            &mid,
+            &load,
+            &factors,
+            &seasonal,
+            ReportExtras::default(),
+        );
+        assert!(!bare.contains("Overcast endurance"));
     }
 }

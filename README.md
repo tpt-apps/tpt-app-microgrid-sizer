@@ -76,3 +76,15 @@ together.
 Website registry entry lives in the web repo's
 `src/lib/tpt-apps-registry.ts` (slug `microgrid-sizer`, category
 `engineering`); listing copy: `GUMROAD.md` / apps.md §T1-9.
+
+## Licence
+
+Source code is dual-licensed under **MIT OR Apache-2.0** (see
+`LICENSE-MIT` and `LICENSE-APACHE`). Branding, listing copy and artwork
+are not covered by the code licence.
+
+The **Pro edition runs on the honour system**: the Gumroad download is a
+self-contained desktop app (its wasm bundle is readable, as any browser
+delivered wasm is). Purchasing grants a personal/organisational licence
+to use it; please don't redistribute the zip. There is deliberately no
+key or activation server.

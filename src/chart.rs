@@ -5,6 +5,10 @@
 //! any number of line/fill series against a shared left axis, one optional
 //! right axis (battery SoC %), and optional highlighted slots (unmet
 //! hours) drawn as translucent bands behind the data.
+//!
+//! Host test builds compile this module for coverage of the data structs and
+//! tick helpers; only the wasm app calls [draw].
+#![cfg_attr(all(test, not(target_arch = "wasm32")), allow(dead_code))]
 
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
@@ -40,6 +44,8 @@ pub struct Chart {
 }
 
 /// Paints `chart` onto `canvas`.
+/// `draw` is consumed by the wasm effects; host test builds compile it for
+/// coverage of the module but never call it.
 pub fn draw(
     canvas: &HtmlCanvasElement,
     chart: &Chart,
@@ -208,5 +214,37 @@ fn format_number(value: f64) -> String {
     } else {
         let trimmed = format!("{:.1}", value);
         trimmed.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{format_number, nice_max};
+
+    #[test]
+    fn nice_max_rounds_up_to_a_four_division_grid() {
+        // Exactly on a step stays put.
+        assert_eq!(nice_max(4.0), 4.0);
+        assert_eq!(nice_max(0.4), 0.4);
+        // Anything between steps rounds up to the next 1/2/2.5/5 x 10^k.
+        assert_eq!(nice_max(3.7), 4.0);
+        assert_eq!(nice_max(0.41), 0.5);
+        assert_eq!(nice_max(6.0), 10.0);
+        assert_eq!(nice_max(1.1), 2.0);
+        assert_eq!(nice_max(1234.0), 2000.0);
+        // Always at least the requested value.
+        for v in [0.01, 0.9, 3.0, 7.7, 55.0, 999.0] {
+            assert!(nice_max(v) >= v, "nice_max({v}) too small");
+        }
+    }
+
+    #[test]
+    fn format_number_keeps_ticks_readable() {
+        assert_eq!(format_number(0.0), "0");
+        assert_eq!(format_number(0.5), "0.5");
+        assert_eq!(format_number(-2.5), "-2.5");
+        assert_eq!(format_number(9.94), "9.9");
+        // >= 10 drops to whole numbers so 12.5 doesn't crowd the axis.
+        assert_eq!(format_number(12.0), "12");
+        assert_eq!(format_number(1000.0), "1000");
     }
 }

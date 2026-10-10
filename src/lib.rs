@@ -10,11 +10,15 @@
 // hosts never double-mount.
 
 // The DOM app compiles only for wasm32 (tpt-appfront-dom is an empty crate
-// on other targets); the engine stays target-independent and host-testable.
+// on other targets); the view layer and chart data compile anywhere so the
+// UI structure is host-unit-testable, and the engine stays fully
+// target-independent.
 #[cfg(target_arch = "wasm32")]
 mod app;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod chart;
+#[cfg(any(target_arch = "wasm32", test))]
+mod view;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

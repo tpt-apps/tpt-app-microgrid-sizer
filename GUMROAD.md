@@ -54,6 +54,16 @@ One-time purchase
 No subscription
 ```
 
+## Licence (honour system)
+
+The zip ships a self-contained desktop app (the wasm bundle is readable, as
+any browser-delivered wasm is). Purchasing grants a personal/organisational
+licence to use the Pro edition — sold on the honour system, no key or
+activation server. The listing and the zip's `README.txt` both ask buyers
+not to redistribute the download. Source code is dual-licensed
+MIT OR Apache-2.0 (`LICENSE-MIT` / `LICENSE-APACHE`); TPT Solutions
+branding, listing copy and `cover.png` stay proprietary.
+
 ## Full description (long-form field)
 
 ```

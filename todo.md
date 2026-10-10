@@ -90,24 +90,35 @@ Done:
       infeasible optimizer target, generator, annual cost
 
 Open — bugs / robustness:
-- [ ] Multi-day cloudy-spell / autonomy check (seasonal model is still
-      optimistic for sites with long overcast runs)
-- [ ] Return an error when solar and load profile lengths differ (currently a
-      short solar array silently becomes zero sun)
-- [ ] Add optimizer cost inputs (and generator settings) to the report
-- [ ] Optimizer objective: minimise annual cost / LCOE rather than capex
-- [ ] Decide Pro licensing: key/activation check or honour system (the zip
-      ships the plaintext pro wasm)
-- [ ] Add a LICENSE file (owner to choose the licence)
-- [ ] `build.sh` should validate its web-repo path argument
-- [ ] Browser/desktop verification of the new Pro inputs (LCOE, generator,
-      steady-state seasonal) — wasm bundle not rebuilt since these changes
+- [x] Multi-day cloudy-spell / autonomy check (`simulate_cloudy_spell`: back-to-back
+      worst-month days from a full battery, SoC carried across days; surfaced in
+      the seasonal results and the report, spell length is a UI input)
+- [x] Error when solar and load profile lengths differ (`ProfileError` —
+      `dispatch_profile` now returns `Result`, so a short solar array is a
+      data-entry error rather than a sunless day)
+- [x] Add optimizer cost inputs (and generator settings) to the report (new
+      "Cost basis" section, so the LCOE is reproducible)
+- [x] Optimizer objective: minimise annual cost / LCOE rather than capex
+      (`OptimizationObjective` — capex / annual cost / LCOE, UI select)
+- [x] Decide Pro licensing: **honour system** — no key/activation check. The
+      $149 zip ships the plaintext pro wasm by design (offline desktop app);
+      Gumroad checkout + the README/GUMROAD notice carry the "personal
+      licence, don't redistribute" ask. No code to maintain, no key servers,
+      no false sense of security from an obfuscation that trivially unwraps
+- [x] Add a LICENSE file — **dual MIT/Apache-2.0** (owner choice):
+      `LICENSE-MIT` + `LICENSE-APACHE`, `license = "MIT OR Apache-2.0"` in all
+      three Cargo.toml manifests (code only — the TPT Solutions branding,
+      listing copy and `cover.png` artwork stay proprietary)
+- [ ] Browser/desktop verification of the new Pro inputs (objective select,
+      overcast spell, cost basis, steady-state seasonal) — the wasm and desktop
+      shells compile clean, but no headless-browser pass has been run yet
+- [x] `build.sh` (and `build.ps1`) validate their web-repo path argument
 
 Open — missing tests:
-- [ ] Report content beyond section headings; leap years, DST / fractional UTC
+- [x] Report content beyond section headings; leap years, DST / fractional UTC
       offsets, panel orientation
 - [ ] UI, chart and desktop shell tests
-- [ ] Test that the free build excludes Pro features
+- [x] Test that the free build excludes Pro features
 
 Open — features (by value):
 - [ ] PV and battery degradation
