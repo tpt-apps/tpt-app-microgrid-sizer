@@ -8,11 +8,16 @@
 use std::rc::Rc;
 
 use tpt_appfront_core::UITree;
-use tpt_microgrid_engine::{presets, DayResult, HOURS_PER_DAY, MONTH_NAMES};
+use tpt_microgrid_engine::{
+    chemistries, presets, site_presets, DayResult, HOURS_PER_DAY, MONTH_NAMES,
+};
 #[cfg(feature = "pro")]
 use tpt_microgrid_engine::MONTHS_PER_YEAR;
 #[cfg(feature = "pro")]
-use tpt_microgrid_engine::{MonthlyFactors, SeasonalResult, SizingRecommendation, SpellResult};
+use tpt_microgrid_engine::{
+    GridYear, InverterReport, MonthlyFactors, ReliabilityReport, SeasonalResult,
+    SizingRecommendation, SpellResult, MAX_AUTONOMY_DAYS,
+};
 
 use crate::chart;
 
@@ -56,6 +61,44 @@ pub(crate) enum Msg {
     /// (pro) run the 12-month simulation.
     #[cfg(feature = "pro")]
     RunSeasonal,
+    /// Fill the battery fields from a chemistry (0 = custom, no change).
+    Chemistry(usize),
+    /// Parse the pasted load CSV into the hourly load inputs.
+    ImportLoad,
+    /// (pro) Calibrate the monthly cloud factors to the pasted weather CSV.
+    #[cfg(feature = "pro")]
+    ImportWeather,
+    /// (pro) Check the inverter rating against the peak and estimate clipping.
+    #[cfg(feature = "pro")]
+    CheckInverter,
+    /// (pro) Compute loss-of-load and battery-only autonomy.
+    #[cfg(feature = "pro")]
+    CheckReliability,
+    /// (pro) Price the year with the grid connected.
+    #[cfg(feature = "pro")]
+    CheckGrid,
+    /// Build the hourly load from the appliance list.
+    BuildLoad,
+    /// Fill the site inputs from a built-in place (0 = custom, no change).
+    SitePreset(usize),
+    /// Fill the site inputs from the device's location (browser permission).
+    UseLocation,
+    /// Choose the colour theme: 0 = follow the system, 1 = light, 2 = dark.
+    Theme(usize),
+    /// Download the hourly balance of the single-day run as CSV.
+    ExportDayCsv,
+    /// (pro) Download the monthly totals of the seasonal run as CSV.
+    #[cfg(feature = "pro")]
+    ExportSeasonalCsv,
+    /// (pro) Download the system-design report as PDF.
+    #[cfg(feature = "pro")]
+    ExportReportPdf,
+    /// Save the current inputs (and the latest run metrics) as a scenario.
+    SaveScenario,
+    /// Restore a saved scenario's inputs.
+    LoadScenario(usize),
+    /// Remove a saved scenario.
+    DeleteScenario(usize),
     /// (pro) run the battery/solar sizing optimization.
     #[cfg(feature = "pro")]
     RunOptimize,
@@ -78,11 +121,35 @@ mod defaults {
     pub const PV_CAP: &str = "5";
     pub const PV_TILT: &str = "30";
     pub const PV_AZ: &str = "0";
+    pub const PV_DEG: &str = "0.5";
+    pub const PV_DCAC: &str = "1.2";
+    /// Appliance rows: (power kW, start hour, hours per day). Only the first
+    /// two are used by default; the rest are empty slots.
+    pub const APPLIANCES: [(&str, &str, &str); 6] = [
+        ("0.15", "0", "24"),
+        ("0.12", "18", "5"),
+        ("0", "0", "0"),
+        ("0", "0", "0"),
+        ("0", "0", "0"),
+        ("0", "0", "0"),
+    ];
+    #[cfg(feature = "pro")]
+    pub const GRID_IMPORT: &str = "0.30";
+    #[cfg(feature = "pro")]
+    pub const GRID_EXPORT: &str = "0.08";
+    #[cfg(feature = "pro")]
+    pub const GRID_DAILY: &str = "0.80";
+    #[cfg(feature = "pro")]
+    pub const GRID_IMPORT_LIMIT: &str = "15";
+    #[cfg(feature = "pro")]
+    pub const GRID_EXPORT_LIMIT: &str = "5";
     pub const BAT_KWH: &str = "10";
     pub const BAT_KW: &str = "5";
     pub const BAT_RTE: &str = "95";
     pub const BAT_MIN: &str = "10";
     pub const BAT_INIT: &str = "50";
+    pub const BAT_FADE: &str = "2";
+    pub const BAT_SD: &str = "0";
     #[cfg(feature = "pro")]
     pub const OPT_PV_COST: &str = "1400";
     #[cfg(feature = "pro")]
@@ -126,6 +193,21 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                 .class("mg-title-row");
                 group.text("Off-grid solar + battery sizing for cabins and small commercial sites — hourly load/generation balance, solved locally in your browser. Units: kW, kWh.")
                     .class("mg-sub");
+                group.container(|theme| {
+                    label(theme, "Theme");
+                    theme
+                        .select(
+                            vec![
+                                ("0".to_string(), "Match system".to_string()),
+                                ("1".to_string(), "Light".to_string()),
+                                ("2".to_string(), "Dark".to_string()),
+                            ],
+                            "0",
+                        )
+                        .class("mg-input mg-theme")
+                        .on_input(|value| Msg::Theme(value.parse::<usize>().unwrap_or(0)));
+                })
+                .class("mg-theme-wrap");
             })
             .class("mg-title-group");
         })
@@ -135,6 +217,36 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
             shell.container(|sidebar| {
                 sidebar.container(|card| {
                     card.heading(3, "Site & day");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Start from a place");
+                            field
+                                .select(
+                                    std::iter::once("Custom (type below)")
+                                        .chain(site_presets().iter().map(|p| p.name))
+                                        .enumerate()
+                                        .map(|(i, name)| (i.to_string(), name.to_string()))
+                                        .collect::<Vec<_>>(),
+                                    "0",
+                                )
+                                .class("mg-input mg-site-preset")
+                                .on_input(|value| {
+                                    Msg::SitePreset(value.parse::<usize>().unwrap_or(0))
+                                });
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|actions| {
+                        actions
+                            .button("Use my location")
+                            .class("mg-btn")
+                            .on_click(Msg::UseLocation);
+                    })
+                    .class("mg-actions");
+                    card.container(|_| {}).class("mg-site-status");
+                    card.text("Finding your coordinates: open any map (Google Maps, LINZ or the Australian national map), right-click your spot and copy the two numbers shown. The first is latitude and the second longitude. Use a minus sign for southern latitudes; longitudes east of Greenwich are positive. The UTC offset is your standard time zone (NZ is +12, eastern Australia +10), not the summer-time offset.")
+                        .class("mg-hint");
                     card.container(|row| {
                         row.container(|field| {
                             label(field, "Latitude (\u{b0})");
@@ -200,13 +312,95 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                         .class("mg-field");
                     })
                     .class("mg-row");
-                    card.text("Azimuth from north: 0 = north-facing (southern-hemisphere sites), 180 = south-facing. Weather: the free edition simulates a clear day; the Pro edition varies cloud month by month.")
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "PV degradation (%/yr)");
+                            field.input(defaults::PV_DEG).class("mg-input mg-pv-deg");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "DC/AC ratio");
+                            field.input(defaults::PV_DCAC).class("mg-input mg-pv-dcac");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.text("Azimuth from north: 0 = north-facing (southern-hemisphere sites), 180 = south-facing. Weather: the free edition simulates a clear day; the Pro edition varies cloud month by month. Degradation applies to the Pro sizing optimizer, which judges designs at end of life.")
                         .class("mg-hint");
                 })
                 .class("mg-card");
 
                 sidebar.container(|card| {
+                    card.heading(3, "Orientations and shading");
+                    card.text("The main plane uses the solar tilt and azimuth above. Extra planes take a percentage of the capacity, and the main plane keeps the rest; leave shares at 0 for a single plane. Shading removes irradiance for whole hours of the day, and overlapping shading combines.")
+                        .class("mg-hint");
+                    for n in 1..=2 {
+                        card.container(|row| {
+                            row.container(|field| {
+                                label(field, format!("Plane {n} share (%)"));
+                                field.input("0").class(format!("mg-input mg-or{n}-share"));
+                            })
+                            .class("mg-field");
+                            row.container(|field| {
+                                label(field, format!("Plane {n} tilt (\u{b0})"));
+                                field.input("30").class(format!("mg-input mg-or{n}-tilt"));
+                            })
+                            .class("mg-field");
+                            row.container(|field| {
+                                label(field, format!("Plane {n} azimuth (\u{b0})"));
+                                field.input("90").class(format!("mg-input mg-or{n}-az"));
+                            })
+                            .class("mg-field");
+                        })
+                        .class("mg-row");
+                    }
+                    for n in 1..=2 {
+                        card.container(|row| {
+                            row.container(|field| {
+                                label(field, format!("Shade {n}: from hour"));
+                                field.input("0").class(format!("mg-input mg-ob{n}-start"));
+                            })
+                            .class("mg-field");
+                            row.container(|field| {
+                                label(field, format!("Shade {n}: to hour"));
+                                field.input("0").class(format!("mg-input mg-ob{n}-end"));
+                            })
+                            .class("mg-field");
+                            row.container(|field| {
+                                label(field, format!("Shade {n}: loss (%)"));
+                                field.input("0").class(format!("mg-input mg-ob{n}-loss"));
+                            })
+                            .class("mg-field");
+                        })
+                        .class("mg-row");
+                    }
+                })
+                .class("mg-card");
+
+                sidebar.container(|card| {
                     card.heading(3, "Battery");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Chemistry");
+                            // Index 0 is "Custom" (leaves the fields alone);
+                            // index n selects `chemistries()[n - 1]`.
+                            field
+                                .select(
+                                    std::iter::once("Custom (manual)")
+                                        .chain(chemistries().iter().map(|c| c.name))
+                                        .enumerate()
+                                        .map(|(i, name)| (i.to_string(), name.to_string()))
+                                        .collect::<Vec<_>>(),
+                                    "1",
+                                )
+                                .class("mg-input mg-bat-chem")
+                                .on_input(|value| {
+                                    Msg::Chemistry(value.parse::<usize>().unwrap_or(0))
+                                });
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
                     card.container(|row| {
                         row.container(|field| {
                             label(field, "Capacity (kWh)");
@@ -238,6 +432,21 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                         .class("mg-field");
                     })
                     .class("mg-row");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Capacity fade (%/yr)");
+                            field.input(defaults::BAT_FADE).class("mg-input mg-bat-fade");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Self-discharge (%/day)");
+                            field.input(defaults::BAT_SD).class("mg-input mg-bat-sd");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.text("Choosing a chemistry fills the battery fields (and, in Pro, the cost, life and kW/kWh inputs) with typical values; edit any of them afterwards.")
+                        .class("mg-hint");
                 })
                 .class("mg-card");
 
@@ -281,6 +490,80 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                             .on_click(Msg::SimulateDay);
                     })
                     .class("mg-actions");
+                })
+                .class("mg-card");
+
+                sidebar.container(|card| {
+                    card.heading(3, "Appliance load builder");
+                    card.text("List what runs and when. Each appliance draws its power for the given hours, wrapping past midnight; the total fills the hourly load above. Leave rows at 0 hours to skip them.")
+                        .class("mg-hint");
+                    for (i, (kw, start, hours)) in defaults::APPLIANCES.iter().enumerate() {
+                        let n = i + 1;
+                        card.container(|row| {
+                            row.container(|field| {
+                                label(field, format!("{n}. Power (kW)"));
+                                field.input(*kw).class(format!("mg-input mg-ap{n}-kw"));
+                            })
+                            .class("mg-field");
+                            row.container(|field| {
+                                label(field, "Start hour (0-23)");
+                                field.input(*start).class(format!("mg-input mg-ap{n}-start"));
+                            })
+                            .class("mg-field");
+                            row.container(|field| {
+                                label(field, "Hours per day");
+                                field.input(*hours).class(format!("mg-input mg-ap{n}-hours"));
+                            })
+                            .class("mg-field");
+                        })
+                        .class("mg-row");
+                    }
+                    card.container(|actions| {
+                        actions
+                            .button("Build hourly load")
+                            .class("mg-btn mg-primary")
+                            .on_click(Msg::BuildLoad);
+                    })
+                    .class("mg-actions");
+                    // The builder's result or errors mount into this placeholder.
+                    card.container(|_| {}).class("mg-appliance-status");
+                })
+                .class("mg-card");
+
+                sidebar.container(|card| {
+                    card.heading(3, "Import data");
+                    card.text("Paste a CSV. Load: 24 hourly kW values (one day) or 8760 (a full year), which fills the hourly load above and, in Pro, the monthly load factors. Any leading timestamp column is ignored.")
+                        .class("mg-hint");
+                    card.container(|field| {
+                        label(field, "Load CSV");
+                        field.textarea("").class("mg-input mg-import-load");
+                    })
+                    .class("mg-field");
+                    card.container(|actions| {
+                        actions
+                            .button("Import load")
+                            .class("mg-btn")
+                            .on_click(Msg::ImportLoad);
+                    })
+                    .class("mg-actions");
+                    #[cfg(feature = "pro")]
+                    {
+                        card.text("Weather: 8760 hourly rows of GHI, DNI and DHI (W/m\u{b2}), e.g. a PVGIS or NIWA typical year. It sets the monthly cloud factors to match the measured yield for the current site and array.")
+                            .class("mg-hint");
+                        card.container(|field| {
+                            label(field, "Weather CSV");
+                            field.textarea("").class("mg-input mg-import-weather");
+                        })
+                        .class("mg-field");
+                        card.container(|actions| {
+                            actions
+                                .button("Import weather")
+                                .class("mg-btn")
+                                .on_click(Msg::ImportWeather);
+                        })
+                        .class("mg-actions");
+                    }
+                    card.container(|_| {}).class("mg-import-status");
                 })
                 .class("mg-card");
 
@@ -488,6 +771,37 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                     card.heading(3, "Results");
                     // The reactive results section mounts into this placeholder.
                     card.container(|_| {}).class("mg-results");
+                    card.container(|actions| {
+                        actions
+                            .button("Download hourly CSV")
+                            .class("mg-btn")
+                            .on_click(Msg::ExportDayCsv);
+                    })
+                    .class("mg-actions");
+                })
+                .class("mg-card");
+
+                main.container(|card| {
+                    card.heading(3, "Saved scenarios");
+                    card.text("Save the inputs to keep a design. Each scenario stores the metrics from the latest runs, so run the seasonal simulation and optimization before saving to compare them. Scenarios are kept in this browser.")
+                        .class("mg-hint");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Scenario name");
+                            field.input("").class("mg-input mg-scen-name");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|actions| {
+                        actions
+                            .button("Save scenario")
+                            .class("mg-btn mg-primary")
+                            .on_click(Msg::SaveScenario);
+                    })
+                    .class("mg-actions");
+                    // The comparison table mounts into this placeholder.
+                    card.container(|_| {}).class("mg-scenarios");
                 })
                 .class("mg-card");
 
@@ -502,9 +816,17 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                     card.container(|_| {}).class("mg-seasonal-results");
                     card.container(|actions| {
                         actions
+                            .button("Download monthly CSV")
+                            .class("mg-btn")
+                            .on_click(Msg::ExportSeasonalCsv);
+                        actions
                             .button("Export design report (.md)")
                             .class("mg-btn")
                             .on_click(Msg::ExportReport);
+                        actions
+                            .button("Export design report (.pdf)")
+                            .class("mg-btn")
+                            .on_click(Msg::ExportReportPdf);
                     })
                     .class("mg-actions");
                 })
@@ -515,6 +837,88 @@ pub(crate) fn shell_tree() -> UITree<Msg> {
                     card.heading(3, "Recommended sizing (Pro)");
                     // The reactive recommendation mounts into this placeholder.
                     card.container(|_| {}).class("mg-rec-results");
+                })
+                .class("mg-card");
+
+                #[cfg(feature = "pro")]
+                main.container(|card| {
+                    card.heading(3, "Inverter check (Pro)");
+                    card.text("Sizes the inverter's AC rating (DC nameplate over the DC/AC ratio) against the peak demand, and estimates the energy the inverter clips across the year, using the monthly factors.")
+                        .class("mg-hint");
+                    card.container(|actions| {
+                        actions
+                            .button("Check inverter")
+                            .class("mg-btn mg-primary")
+                            .on_click(Msg::CheckInverter);
+                    })
+                    .class("mg-actions");
+                    // The reactive inverter result mounts into this placeholder.
+                    card.container(|_| {}).class("mg-inverter");
+                })
+                .class("mg-card");
+
+                #[cfg(feature = "pro")]
+                main.container(|card| {
+                    card.heading(3, "Reliability (Pro)");
+                    card.text("Loss of load over the year, from the same representative days as the seasonal run and including any backup generator, plus how long the battery alone can carry the worst month with no sun.")
+                        .class("mg-hint");
+                    card.container(|actions| {
+                        actions
+                            .button("Check reliability")
+                            .class("mg-btn mg-primary")
+                            .on_click(Msg::CheckReliability);
+                    })
+                    .class("mg-actions");
+                    // The reactive reliability result mounts into this placeholder.
+                    card.container(|_| {}).class("mg-reliability");
+                })
+                .class("mg-card");
+
+                #[cfg(feature = "pro")]
+                main.container(|card| {
+                    card.heading(3, "Grid connection and tariffs (Pro)");
+                    card.text("The grid covers load the system leaves unmet (up to the import limit) and takes surplus the battery cannot store (up to the export limit). It never charges the battery. Tariffs are flat; export at the import price models net metering.")
+                        .class("mg-hint");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Import price (US$/kWh)");
+                            field.input(defaults::GRID_IMPORT).class("mg-input mg-grid-import");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Export credit (US$/kWh)");
+                            field.input(defaults::GRID_EXPORT).class("mg-input mg-grid-export");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Daily charge (US$/day)");
+                            field.input(defaults::GRID_DAILY).class("mg-input mg-grid-daily");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|row| {
+                        row.container(|field| {
+                            label(field, "Import limit (kW)");
+                            field.input(defaults::GRID_IMPORT_LIMIT).class("mg-input mg-grid-imlim");
+                        })
+                        .class("mg-field");
+                        row.container(|field| {
+                            label(field, "Export limit (kW)");
+                            field.input(defaults::GRID_EXPORT_LIMIT).class("mg-input mg-grid-exlim");
+                        })
+                        .class("mg-field");
+                    })
+                    .class("mg-row");
+                    card.container(|actions| {
+                        actions
+                            .button("Price the year")
+                            .class("mg-btn mg-primary")
+                            .on_click(Msg::CheckGrid);
+                    })
+                    .class("mg-actions");
+                    // The reactive grid result mounts into this placeholder.
+                    card.container(|_| {}).class("mg-grid");
                 })
                 .class("mg-card");
 
@@ -599,6 +1003,370 @@ fn footer_link(c: &mut tpt_appfront_core::ContainerBuilder<Msg>, label: &str, ur
     c.button(label)
         .class("mg-footer-link")
         .on_click(Msg::VisitSite(url.to_string()));
+}
+
+/// Metrics stored with a saved scenario, taken from the last runs at save
+/// time. A field is `None` when that run had not been done (for example,
+/// the optimizer metrics in a scenario saved before optimizing).
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct ScenarioMetrics {
+    /// Annual served fraction from the seasonal run, percent.
+    pub served_pct: Option<f64>,
+    /// Annual unmet energy from the seasonal run, kWh.
+    pub unmet_kwh: Option<f64>,
+    /// Recommended PV capacity, kWp.
+    pub pv_kw: Option<f64>,
+    /// Recommended battery capacity, kWh.
+    pub battery_kwh: Option<f64>,
+    /// Estimated installed capex, USD.
+    pub capex_usd: Option<f64>,
+    /// Levelised annual cost, USD per year.
+    pub annual_cost_usd: Option<f64>,
+    /// Levelised cost of energy, USD per kWh served.
+    pub lcoe_usd_per_kwh: Option<f64>,
+}
+
+impl ScenarioMetrics {
+    /// Storage keys and values, in a fixed order.
+    pub(crate) fn fields(&self) -> [(&'static str, Option<f64>); 7] {
+        [
+            ("served_pct", self.served_pct),
+            ("unmet_kwh", self.unmet_kwh),
+            ("pv_kw", self.pv_kw),
+            ("battery_kwh", self.battery_kwh),
+            ("capex_usd", self.capex_usd),
+            ("annual_cost_usd", self.annual_cost_usd),
+            ("lcoe_usd_per_kwh", self.lcoe_usd_per_kwh),
+        ]
+    }
+
+    /// Rebuilds from stored values; `get` returns `None` for a missing key.
+    pub(crate) fn from_fields(get: impl Fn(&str) -> Option<f64>) -> Self {
+        Self {
+            served_pct: get("served_pct"),
+            unmet_kwh: get("unmet_kwh"),
+            pv_kw: get("pv_kw"),
+            battery_kwh: get("battery_kwh"),
+            capex_usd: get("capex_usd"),
+            annual_cost_usd: get("annual_cost_usd"),
+            lcoe_usd_per_kwh: get("lcoe_usd_per_kwh"),
+        }
+    }
+
+    /// Comparison-table rows: label and display value ("—" when unknown).
+    pub(crate) fn rows(&self) -> Vec<(&'static str, String)> {
+        fn shown(value: Option<f64>, format: impl Fn(f64) -> String) -> String {
+            match value {
+                Some(v) if v.is_finite() => format(v),
+                _ => "\u{2014}".to_string(),
+            }
+        }
+        vec![
+            ("Annual served", shown(self.served_pct, |v| format!("{v:.1}%"))),
+            ("Unmet energy per year", shown(self.unmet_kwh, fmt_kwh)),
+            ("PV (kWp)", shown(self.pv_kw, |v| format!("{v:.1}"))),
+            ("Battery (kWh)", shown(self.battery_kwh, |v| format!("{v:.1}"))),
+            ("Capex (US$)", shown(self.capex_usd, |v| format!("{v:.0}"))),
+            ("Annual cost (US$/yr)", shown(self.annual_cost_usd, |v| format!("{v:.0}"))),
+            ("LCOE (US$/kWh)", shown(self.lcoe_usd_per_kwh, |v| format!("{v:.3}"))),
+        ]
+    }
+}
+
+/// A saved scenario: its name, every input value in page order, and the
+/// metrics captured when it was saved.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Scenario {
+    /// User-given name (shown as the column header).
+    pub name: String,
+    /// Input values in DOM order, restored by position.
+    pub values: Vec<String>,
+    /// Metrics from the last runs at save time.
+    pub metrics: ScenarioMetrics,
+}
+
+/// The side-by-side comparison of saved scenarios: one column per scenario,
+/// one row per metric, with Load and Delete under each name.
+pub(crate) fn scenarios_view(scenarios: Vec<Scenario>) -> UITree<Msg> {
+    UITree::container(|c| {
+        if scenarios.is_empty() {
+            styled_text(
+                c,
+                "No saved scenarios yet. Save the current inputs to compare designs side by side.",
+                "mg-detail",
+            );
+            return;
+        }
+        c.container(|table| {
+            table
+                .container(|row| {
+                    row.container(|_| {}).class("mg-cmp-head");
+                    for (i, scenario) in scenarios.iter().enumerate() {
+                        row.container(|cell| {
+                            styled_text(cell, scenario.name.clone(), "mg-cmp-name");
+                            cell.container(|actions| {
+                                actions
+                                    .button("Load")
+                                    .class("mg-btn")
+                                    .on_click(Msg::LoadScenario(i));
+                                actions
+                                    .button("Delete")
+                                    .class("mg-btn")
+                                    .on_click(Msg::DeleteScenario(i));
+                            })
+                            .class("mg-actions");
+                        })
+                        .class("mg-cmp-cell");
+                    }
+                })
+                .class("mg-cmp-row");
+            let labels = scenarios[0].metrics.rows();
+            for (r, (label, _)) in labels.iter().enumerate() {
+                table
+                    .container(|row| {
+                        styled_text(row, *label, "mg-cmp-label");
+                        for scenario in &scenarios {
+                            let value = scenario.metrics.rows()[r].1.clone();
+                            styled_text(row, value, "mg-cmp-cell");
+                        }
+                    })
+                    .class("mg-cmp-row");
+            }
+        })
+        .class("mg-cmp");
+    })
+}
+
+/// The inverter check's current content (Pro).
+#[cfg(feature = "pro")]
+#[derive(Clone)]
+pub(crate) enum InverterOutcome {
+    Idle,
+    Invalid(Vec<String>),
+    Solved(Rc<InverterReport>),
+}
+
+/// The reliability check's current content (Pro).
+#[cfg(feature = "pro")]
+#[derive(Clone)]
+pub(crate) enum ReliabilityOutcome {
+    Idle,
+    Invalid(Vec<String>),
+    Solved(Rc<ReliabilityReport>),
+}
+
+/// The grid check's current content (Pro): the year's grid energy and bills,
+/// and the installed cost used for the payback.
+#[cfg(feature = "pro")]
+#[derive(Clone)]
+pub(crate) enum GridOutcome {
+    Idle,
+    Invalid(Vec<String>),
+    Solved(Rc<GridYear>, f64),
+}
+
+/// The reactive grid section (Pro).
+#[cfg(feature = "pro")]
+pub(crate) fn grid_view(outcome: GridOutcome) -> UITree<Msg> {
+    UITree::container(|c| match outcome {
+        GridOutcome::Idle => {
+            styled_text(
+                c,
+                "Press \u{201c}Price the year\u{201d} to compare the bill with and without the system, given the tariff and grid limits.",
+                "mg-detail",
+            );
+        }
+        GridOutcome::Invalid(issues) => {
+            c.container(|list| {
+                for issue in issues {
+                    styled_text(list, issue, "mg-issue");
+                }
+            })
+            .class("mg-issues");
+        }
+        GridOutcome::Solved(year, capex_usd) => {
+            // A negative bill is a credit: exports earned more than the
+            // imports and the daily charge cost.
+            let with = if year.bill_with_system_usd < 0.0 {
+                format!("a credit of US$ {:.0}", -year.bill_with_system_usd)
+            } else {
+                format!("US$ {:.0}", year.bill_with_system_usd)
+            };
+            styled_text(
+                c,
+                format!(
+                    "Annual bill: US$ {:.0} without the system, {with} with it.",
+                    year.bill_without_system_usd
+                ),
+                "mg-headline",
+            );
+            let savings = year.savings_usd();
+            let payback = match year.simple_payback_years(capex_usd) {
+                Some(years) => format!("simple payback on US$ {capex_usd:.0} in {years:.1} years"),
+                None if capex_usd > 0.0 => "no saving, so no payback".to_string(),
+                None => "no system cost entered, so no payback".to_string(),
+            };
+            styled_text(
+                c,
+                format!("Saving US$ {savings:.0} a year; {payback}."),
+                if savings > 0.0 { "mg-detail" } else { "mg-warn" },
+            );
+            styled_text(
+                c,
+                format!(
+                    "Bought {}, sold {} over the year.",
+                    fmt_kwh(year.imported_kwh),
+                    fmt_kwh(year.exported_kwh)
+                ),
+                "mg-detail",
+            );
+            if year.unmet_kwh > 0.01 {
+                styled_text(
+                    c,
+                    format!(
+                        "Load still unserved after the import limit: {} a year.",
+                        fmt_kwh(year.unmet_kwh)
+                    ),
+                    "mg-warn",
+                );
+            }
+        }
+    })
+}
+
+/// The reactive reliability section (Pro).
+#[cfg(feature = "pro")]
+pub(crate) fn reliability_view(outcome: ReliabilityOutcome) -> UITree<Msg> {
+    UITree::container(|c| match outcome {
+        ReliabilityOutcome::Idle => {
+            styled_text(
+                c,
+                "Press \u{201c}Check reliability\u{201d} for how often load goes unserved and how long the battery alone can carry the worst month.",
+                "mg-detail",
+            );
+        }
+        ReliabilityOutcome::Invalid(issues) => {
+            c.container(|list| {
+                for issue in issues {
+                    styled_text(list, issue, "mg-issue");
+                }
+            })
+            .class("mg-issues");
+        }
+        ReliabilityOutcome::Solved(rel) => {
+            styled_text(
+                c,
+                format!(
+                    "{:.2}% of hours unserved ({:.0} hours a year), on {:.1} days a year.",
+                    rel.lolp * 100.0,
+                    rel.loss_of_load_hours_per_year,
+                    rel.lole_days_per_year
+                ),
+                "mg-headline",
+            );
+            let capped = rel.autonomy_days >= MAX_AUTONOMY_DAYS;
+            styled_text(
+                c,
+                format!(
+                    "Battery alone carries the worst month for {:.2} days{}.",
+                    rel.autonomy_days,
+                    if capped {
+                        format!(" (capped at {MAX_AUTONOMY_DAYS:.0})")
+                    } else {
+                        String::new()
+                    }
+                ),
+                "mg-detail",
+            );
+        }
+    })
+}
+
+/// The reactive inverter-check section (Pro).
+#[cfg(feature = "pro")]
+pub(crate) fn inverter_view(outcome: InverterOutcome) -> UITree<Msg> {
+    UITree::container(|c| match outcome {
+        InverterOutcome::Idle => {
+            styled_text(
+                c,
+                "Press \u{201c}Check inverter\u{201d} to compare the AC rating with the peak demand and estimate clipping.",
+                "mg-detail",
+            );
+        }
+        InverterOutcome::Invalid(issues) => {
+            c.container(|list| {
+                for issue in issues {
+                    styled_text(list, issue, "mg-issue");
+                }
+            })
+            .class("mg-issues");
+        }
+        InverterOutcome::Solved(check) => {
+            styled_text(
+                c,
+                format!(
+                    "AC rating {:.2} kW for {:.1} kWp DC (DC/AC {:.2}).",
+                    check.ac_rating_kw, check.dc_kwp, check.dc_ac_ratio
+                ),
+                "mg-headline",
+            );
+            if check.covers_peak {
+                styled_text(
+                    c,
+                    format!(
+                        "Peak demand {:.2} kW is covered by the rating.",
+                        check.peak_demand_kw
+                    ),
+                    "mg-detail",
+                );
+            } else {
+                styled_text(
+                    c,
+                    format!(
+                        "Peak demand {:.2} kW exceeds the rating: the inverter is too small for the peak. Lower the DC/AC ratio or add inverter capacity.",
+                        check.peak_demand_kw
+                    ),
+                    "mg-warn",
+                );
+            }
+            styled_text(
+                c,
+                format!(
+                    "Clipping loses {} per year, {:.1}% of the unclipped PV output.",
+                    fmt_kwh(check.clipped_kwh_per_year),
+                    check.clipped_fraction * 100.0
+                ),
+                "mg-detail",
+            );
+        }
+    })
+}
+
+/// The import card's last result: nothing yet, a success note, or the
+/// reasons a file was refused.
+#[derive(Clone)]
+pub(crate) enum ImportOutcome {
+    Idle,
+    Done(String),
+    Failed(Vec<String>),
+}
+
+/// The reactive import status line, mounted under the import inputs.
+pub(crate) fn import_status_view(outcome: ImportOutcome) -> UITree<Msg> {
+    UITree::container(|c| match outcome {
+        ImportOutcome::Idle => {}
+        ImportOutcome::Done(text) => {
+            styled_text(c, text, "mg-detail");
+        }
+        ImportOutcome::Failed(issues) => {
+            c.container(|list| {
+                for issue in issues {
+                    styled_text(list, issue, "mg-issue");
+                }
+            })
+            .class("mg-issues");
+        }
+    })
 }
 
 /// The reactive single-day results section.
@@ -705,6 +1473,7 @@ pub(crate) fn day_chart(result: &DayResult) -> chart::Chart {
     chart::Chart {
         series: vec![
             chart::ChartSeries {
+                name: "Solar",
                 color: "#e0972a",
                 fill_color: Some("rgba(224,151,42,0.20)"),
                 values: result.hours.iter().map(|h| h.solar_kw).collect(),
@@ -712,6 +1481,7 @@ pub(crate) fn day_chart(result: &DayResult) -> chart::Chart {
                 right_axis: false,
             },
             chart::ChartSeries {
+                name: "Load",
                 color: "#4a5568",
                 fill_color: None,
                 values: result.hours.iter().map(|h| h.load_kw).collect(),
@@ -719,6 +1489,7 @@ pub(crate) fn day_chart(result: &DayResult) -> chart::Chart {
                 right_axis: false,
             },
             chart::ChartSeries {
+                name: "Battery charge",
                 color: "#2e9e6b",
                 fill_color: None,
                 values: result.hours.iter().map(|h| h.soc * 100.0).collect(),
@@ -839,7 +1610,6 @@ fn percent_served(unmet: f64, load: f64) -> f64 {
     }
 }
 
-#[cfg(feature = "pro")]
 fn fmt_kwh(kwh: f64) -> String {
     if kwh >= 10_000.0 {
         format!("{:.1} MWh", kwh / 1000.0)
@@ -854,6 +1624,7 @@ pub(crate) fn seasonal_chart(result: &SeasonalResult) -> chart::Chart {
     chart::Chart {
         series: vec![
             chart::ChartSeries {
+                name: "Solar",
                 color: "#e0972a",
                 fill_color: Some("rgba(224,151,42,0.20)"),
                 values: result.months.iter().map(|m| m.solar_kwh).collect(),
@@ -861,6 +1632,7 @@ pub(crate) fn seasonal_chart(result: &SeasonalResult) -> chart::Chart {
                 right_axis: false,
             },
             chart::ChartSeries {
+                name: "Load",
                 color: "#4a5568",
                 fill_color: None,
                 values: result.months.iter().map(|m| m.load_kwh).collect(),
@@ -868,6 +1640,7 @@ pub(crate) fn seasonal_chart(result: &SeasonalResult) -> chart::Chart {
                 right_axis: false,
             },
             chart::ChartSeries {
+                name: "Unmet",
                 color: "#b3261e",
                 fill_color: None,
                 values: result.months.iter().map(|m| m.unmet_kwh).collect(),
@@ -972,6 +1745,8 @@ mod tests {
             round_trip_efficiency: 1.0,
             min_soc: 0.0,
             initial_soc: 1.0,
+            annual_fade: 0.0,
+            self_discharge_per_day: 0.0,
         };
         let load = DayLoad {
             hourly_kw: vec![2.0; HOURS_PER_DAY],
@@ -984,8 +1759,11 @@ mod tests {
         let tree = inspect_tree(&shell_tree());
         for class in [
             "mg-lat", "mg-lon", "mg-tz", "mg-alt", "mg-month", "mg-pv-cap", "mg-pv-tilt",
-            "mg-pv-az", "mg-bat-kwh", "mg-bat-kw", "mg-bat-rte", "mg-bat-min", "mg-bat-init",
-            "mg-preset",
+            "mg-pv-az", "mg-pv-deg", "mg-pv-dcac", "mg-bat-kwh", "mg-bat-kw", "mg-bat-rte", "mg-bat-min",
+            "mg-bat-init", "mg-bat-fade", "mg-bat-sd", "mg-bat-chem", "mg-preset",
+            "mg-import-load", "mg-import-status", "mg-scen-name", "mg-scenarios",
+            "mg-ap1-kw", "mg-ap6-hours", "mg-appliance-status", "mg-or1-share", "mg-ob2-loss",
+            "mg-theme", "mg-site-preset", "mg-site-status",
         ] {
             assert!(tree.contains(class), "shell is missing {class}");
         }
@@ -1267,7 +2045,7 @@ mod tests {
             "Latitude must be a number.".to_string(),
         ])));
         assert!(invalid.contains("Latitude must be a number."));
-        assert!(invalid.contains("class=\""mg-issues\"\""));
+        assert!(invalid.contains("class=\"mg-issues\""));
 
         let rec_invalid = inspect_tree(&rec_results_view(RecOutcome::Invalid(vec![
             "Target served fraction must be between 50% and 100%.".to_string(),
@@ -1288,4 +2066,194 @@ mod tests {
             panic!("expected VisitSite");
         };
         assert_eq!(url, "https://tptsolutions.co.nz/tools");
+
+        let chemistry = Msg::Chemistry(3);
+        let Msg::Chemistry(index) = chemistry else {
+            panic!("expected Chemistry");
+        };
+        assert_eq!(index, 3);
+
+        let site = Msg::SitePreset(3);
+        let Msg::SitePreset(index) = site else {
+            panic!("expected SitePreset");
+        };
+        assert_eq!(index, 3);
+        let theme = Msg::Theme(2);
+        let Msg::Theme(index) = theme else {
+            panic!("expected Theme");
+        };
+        assert_eq!(index, 2);
+
+        let load = Msg::LoadScenario(1);
+        let Msg::LoadScenario(index) = load else {
+            panic!("expected LoadScenario");
+        };
+        assert_eq!(index, 1);
+        let delete = Msg::DeleteScenario(2);
+        let Msg::DeleteScenario(index) = delete else {
+            panic!("expected DeleteScenario");
+        };
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn import_status_renders_each_outcome() {
+        let failed = inspect_tree(&import_status_view(ImportOutcome::Failed(vec![
+            "Found 3 data rows; expected 24.".to_string(),
+        ])));
+        assert!(failed.contains("Found 3 data rows"));
+        assert!(failed.contains("mg-issues"));
+
+        let done = inspect_tree(&import_status_view(ImportOutcome::Done(
+            "Loaded a 24-hour profile into the hourly load.".to_string(),
+        )));
+        assert!(done.contains("Loaded a 24-hour profile"));
+        assert!(!done.contains("mg-issues"));
+
+        let idle = inspect_tree(&import_status_view(ImportOutcome::Idle));
+        assert!(!idle.contains("mg-issues"));
+    }
+
+    #[test]
+    fn scenario_metrics_round_trip_and_format() {
+        let metrics = ScenarioMetrics {
+            served_pct: Some(98.46),
+            pv_kw: Some(12.0),
+            lcoe_usd_per_kwh: Some(f64::INFINITY),
+            ..ScenarioMetrics::default()
+        };
+        let stored: std::collections::HashMap<&str, f64> = metrics
+            .fields()
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|v| (key, v)))
+            .collect();
+        let restored = ScenarioMetrics::from_fields(|key| stored.get(key).copied());
+        assert_eq!(restored.served_pct, Some(98.46));
+        assert_eq!(restored.pv_kw, Some(12.0));
+        assert_eq!(restored.battery_kwh, None);
+
+        let rows = metrics.rows();
+        assert_eq!(rows[0], ("Annual served", "98.5%".to_string()));
+        assert_eq!(rows[2], ("PV (kWp)", "12.0".to_string()));
+        // Unknown and non-finite values show as a dash, never "inf".
+        assert_eq!(rows[6].1, "\u{2014}");
+        assert_eq!(rows[3].1, "\u{2014}");
+    }
+
+    #[test]
+    fn scenarios_view_lists_each_scenario_with_actions() {
+        let empty = inspect_tree(&scenarios_view(Vec::new()));
+        assert!(empty.contains("No saved scenarios yet"));
+
+        let scenarios = vec![
+            Scenario {
+                name: "Cabin".to_string(),
+                values: vec!["5".to_string()],
+                metrics: ScenarioMetrics {
+                    pv_kw: Some(5.0),
+                    ..ScenarioMetrics::default()
+                },
+            },
+            Scenario {
+                name: "Bigger".to_string(),
+                values: vec!["8".to_string()],
+                metrics: ScenarioMetrics::default(),
+            },
+        ];
+        let tree = inspect_tree(&scenarios_view(scenarios));
+        assert!(tree.contains("Cabin"));
+        assert!(tree.contains("Bigger"));
+        assert!(tree.contains("Button \"Load\""));
+        assert!(tree.contains("Button \"Delete\""));
+        assert!(tree.contains("PV (kWp)"));
+        assert!(tree.contains("mg-cmp"));
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn inverter_view_reports_coverage_and_clipping() {
+        let report = |covers_peak: bool| InverterReport {
+            dc_kwp: 5.0,
+            dc_ac_ratio: 1.2,
+            ac_rating_kw: 4.17,
+            peak_demand_kw: if covers_peak { 2.0 } else { 6.0 },
+            covers_peak,
+            clipped_kwh_per_year: 120.0,
+            clipped_fraction: 0.02,
+        };
+        let short = inspect_tree(&inverter_view(InverterOutcome::Solved(Rc::new(report(false)))));
+        assert!(short.contains("exceeds the rating"));
+        assert!(short.contains("mg-warn"));
+        assert!(short.contains("2.0%"));
+
+        let fine = inspect_tree(&inverter_view(InverterOutcome::Solved(Rc::new(report(true)))));
+        assert!(fine.contains("covered by the rating"));
+        assert!(!fine.contains("mg-warn"));
+
+        let idle = inspect_tree(&inverter_view(InverterOutcome::Idle));
+        assert!(idle.contains("Check inverter"));
+
+        let invalid = inspect_tree(&inverter_view(InverterOutcome::Invalid(vec![
+            "DC/AC ratio must be between 0.5 and 2.0.".to_string(),
+        ])));
+        assert!(invalid.contains("DC/AC ratio must be"));
+        assert!(invalid.contains("mg-issues"));
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn grid_view_reports_bills_saving_and_payback() {
+        let year = GridYear {
+            load_kwh: 8760.0,
+            imported_kwh: 6000.0,
+            exported_kwh: 800.0,
+            unmet_kwh: 0.0,
+            curtailed_kwh: 0.0,
+            bill_without_system_usd: 2800.0,
+            bill_with_system_usd: 1700.0,
+        };
+        let tree = inspect_tree(&grid_view(GridOutcome::Solved(Rc::new(year.clone()), 14000.0)));
+        assert!(tree.contains("US$ 2800 without the system"));
+        // 14,000 / (2,800 - 1,700) = 12.7 years.
+        assert!(tree.contains("simple payback on US$ 14000 in 12.7 years"));
+        assert!(!tree.contains("Load still unserved"));
+
+        // An export credit larger than the bill reads as a credit, not "-".
+        let credit = GridYear {
+            bill_with_system_usd: -220.0,
+            ..year.clone()
+        };
+        let tree = inspect_tree(&grid_view(GridOutcome::Solved(Rc::new(credit), 0.0)));
+        assert!(tree.contains("a credit of US$ 220 with it"), "{tree}");
+        assert!(!tree.contains("US$ -"));
+
+        let idle = inspect_tree(&grid_view(GridOutcome::Idle));
+        assert!(idle.contains("Price the year"));
+
+        let invalid = inspect_tree(&grid_view(GridOutcome::Invalid(vec![
+            "Import price must be between 0 and 5 $/kWh.".to_string(),
+        ])));
+        assert!(invalid.contains("Import price must be between"));
+    }
+
+    #[cfg(feature = "pro")]
+    #[test]
+    fn reliability_view_reports_lolp_and_autonomy() {
+        let report = ReliabilityReport {
+            lolp: 0.0123,
+            loss_of_load_hours_per_year: 107.8,
+            lole_days_per_year: 9.0,
+            autonomy_days: MAX_AUTONOMY_DAYS,
+        };
+        let tree = inspect_tree(&reliability_view(ReliabilityOutcome::Solved(Rc::new(report))));
+        assert!(tree.contains("1.23% of hours unserved"));
+        assert!(tree.contains("capped at 60"));
+
+        let idle = inspect_tree(&reliability_view(ReliabilityOutcome::Idle));
+        assert!(idle.contains("Check reliability"));
+
+        let invalid = inspect_tree(&reliability_view(ReliabilityOutcome::Invalid(vec![
+            "Battery capacity must be between 0 and 10,000 kWh.".to_string(),
+        ])));
+        assert!(invalid.contains("Battery capacity"));
     }}
